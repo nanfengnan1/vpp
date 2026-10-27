@@ -106,7 +106,8 @@ vxlan_add_del_tunnel_clean_input (vnet_vxlan_add_del_tunnel_args_t *a,
       return VNET_API_ERROR_NO_SUCH_FIB;
     }
 
-  if (ip46_address_is_ip4 (&a->src) != ip46_address_is_ip4 (&a->dst))
+  if (!ip46_address_is_zero (&a->dst) &&
+      ip46_address_is_ip4 (&a->src) != ip46_address_is_ip4 (&a->dst))
     {
       return VNET_API_ERROR_INVALID_VALUE;
     }
@@ -226,9 +227,9 @@ static void send_vxlan_tunnel_details
   rmp->_vl_msg_id = ntohs (REPLY_MSG_ID_BASE + VL_API_VXLAN_TUNNEL_DETAILS);
 
   ip_address_encode (&t->src, IP46_TYPE_ANY, &rmp->src_address);
-  ip_address_encode (&t->dst, IP46_TYPE_ANY, &rmp->dst_address);
+  ip_address_encode (&t->dst, ip46_address_is_ip4 (&t->src) ? IP46_TYPE_IP4 : IP46_TYPE_IP6, &rmp->dst_address);
 
-  if (ip46_address_is_ip4 (&t->dst))
+  if (ip46_address_is_ip4 (&t->src))
     rmp->encap_vrf_id = htonl (im4->fibs[t->encap_fib_index].ft_table_id);
   else
     rmp->encap_vrf_id = htonl (im6->fibs[t->encap_fib_index].ft_table_id);
@@ -287,11 +288,11 @@ send_vxlan_tunnel_v2_details (vxlan_tunnel_t *t, vl_api_registration_t *reg,
   rmp->_vl_msg_id = ntohs (REPLY_MSG_ID_BASE + VL_API_VXLAN_TUNNEL_V2_DETAILS);
 
   ip_address_encode (&t->src, IP46_TYPE_ANY, &rmp->src_address);
-  ip_address_encode (&t->dst, IP46_TYPE_ANY, &rmp->dst_address);
+  ip_address_encode (&t->dst, ip46_address_is_ip4 (&t->src) ? IP46_TYPE_IP4 : IP46_TYPE_IP6, &rmp->dst_address);
   rmp->src_port = htons (t->src_port);
   rmp->dst_port = htons (t->dst_port);
 
-  if (ip46_address_is_ip4 (&t->dst))
+  if (ip46_address_is_ip4 (&t->src))
     rmp->encap_vrf_id = htonl (im4->fibs[t->encap_fib_index].ft_table_id);
   else
     rmp->encap_vrf_id = htonl (im6->fibs[t->encap_fib_index].ft_table_id);
@@ -334,6 +335,98 @@ vl_api_vxlan_tunnel_v2_dump_t_handler (vl_api_vxlan_tunnel_v2_dump_t *mp)
 	}
       t = &vxm->tunnels[vxm->tunnel_index_by_sw_if_index[sw_if_index]];
       send_vxlan_tunnel_v2_details (t, reg, mp->context);
+    }
+}
+
+static void
+vl_api_vxlan_mp_remote_add_del_t_handler (vl_api_vxlan_mp_remote_add_del_t *mp)
+{
+  vl_api_vxlan_mp_remote_add_del_reply_t *rmp;
+  ip46_address_t remote = {};
+  clib_memcpy (&remote.ip4, mp->remote, sizeof (remote.ip4));
+  int rv = vxlan_mp_remote_update (ntohl (mp->sw_if_index), mp->mac, remote,
+                                   mp->bum, mp->is_add);
+  REPLY_MACRO (VL_API_VXLAN_MP_REMOTE_ADD_DEL_REPLY);
+}
+
+static void
+send_mp_remote (vl_api_registration_t *reg, u32 context, vxlan_tunnel_t *t,
+                u64 mac, ip4_address_t remote, u8 bum)
+{
+  vl_api_vxlan_mp_remote_details_t *rmp = vl_msg_api_alloc_zero (sizeof (*rmp));
+  rmp->_vl_msg_id = htons (REPLY_MSG_ID_BASE + VL_API_VXLAN_MP_REMOTE_DETAILS);
+  rmp->context = context;
+  rmp->sw_if_index = htonl (t->sw_if_index);
+  clib_memcpy (rmp->mac, &mac, 6);
+  clib_memcpy (rmp->remote, &remote, sizeof (remote));
+  rmp->bum = bum;
+  vl_api_send_msg (reg, (u8 *) rmp);
+}
+
+static void
+vl_api_vxlan_mp_remote_dump_t_handler (vl_api_vxlan_mp_remote_dump_t *mp)
+{
+  vl_api_registration_t *reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg) return;
+  u32 sw = ntohl (mp->sw_if_index);
+  vxlan_tunnel_t *t;
+  pool_foreach (t, vxlan_main.tunnels)
+    {
+      if (!t->multipoint || !ip46_address_is_ip4 (&t->src) ||
+          (sw != ~0 && sw != t->sw_if_index)) continue;
+      uword mac, remote;
+      hash_foreach (mac, remote, t->remote_by_mac, {
+        send_mp_remote (reg, mp->context, t, mac,
+                        t->remote_ips[remote].ip4, 0);
+      });
+      ip46_address_t *dst;
+      vec_foreach (dst, t->flood_remotes)
+        send_mp_remote (reg, mp->context, t, 0, dst->ip4, 1);
+    }
+}
+
+static void
+vl_api_vxlan_mp_remote_add_del_v2_t_handler (vl_api_vxlan_mp_remote_add_del_v2_t *mp)
+{
+  vl_api_vxlan_mp_remote_add_del_v2_reply_t *rmp;
+  ip46_address_t remote;
+  ip_address_decode (&mp->remote, &remote);
+  int rv = vxlan_mp_remote_update (ntohl (mp->sw_if_index), mp->mac, remote,
+                                   mp->bum, mp->is_add);
+  REPLY_MACRO (VL_API_VXLAN_MP_REMOTE_ADD_DEL_V2_REPLY);
+}
+
+static void
+send_mp_remote_v2 (vl_api_registration_t *reg, u32 context, vxlan_tunnel_t *t,
+                   u64 mac, ip46_address_t remote, u8 bum)
+{
+  vl_api_vxlan_mp_remote_v2_details_t *rmp = vl_msg_api_alloc_zero (sizeof (*rmp));
+  rmp->_vl_msg_id = htons (REPLY_MSG_ID_BASE + VL_API_VXLAN_MP_REMOTE_V2_DETAILS);
+  rmp->context = context;
+  rmp->sw_if_index = htonl (t->sw_if_index);
+  clib_memcpy (rmp->mac, &mac, 6);
+  ip_address_encode (&remote, IP46_TYPE_ANY, &rmp->remote);
+  rmp->bum = bum;
+  vl_api_send_msg (reg, (u8 *) rmp);
+}
+
+static void
+vl_api_vxlan_mp_remote_v2_dump_t_handler (vl_api_vxlan_mp_remote_v2_dump_t *mp)
+{
+  vl_api_registration_t *reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg) return;
+  u32 sw = ntohl (mp->sw_if_index);
+  vxlan_tunnel_t *t;
+  pool_foreach (t, vxlan_main.tunnels)
+    {
+      if (!t->multipoint || (sw != ~0 && sw != t->sw_if_index)) continue;
+      uword mac, remote;
+      hash_foreach (mac, remote, t->remote_by_mac, {
+        send_mp_remote_v2 (reg, mp->context, t, mac, t->remote_ips[remote], 0);
+      });
+      ip46_address_t *dst;
+      vec_foreach (dst, t->flood_remotes)
+        send_mp_remote_v2 (reg, mp->context, t, 0, *dst, 1);
     }
 }
 

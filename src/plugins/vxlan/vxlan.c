@@ -77,6 +77,9 @@ format_vxlan_tunnel (u8 * s, va_list * args)
 	      t->sw_if_index);
 
   s = format (s, "encap-dpo-idx %d ", t->next_dpo.dpoi_index);
+  if (t->multipoint)
+    s = format (s, "multipoint macs %u bum-remotes %u ",
+                hash_elts (t->remote_by_mac), vec_len (t->flood_remotes));
 
   if (PREDICT_FALSE (t->decap_next_index != VXLAN_INPUT_NEXT_L2_INPUT))
     s = format (s, "decap-next-%U ", format_decap_next, t->decap_next_index);
@@ -360,6 +363,15 @@ int vnet_vxlan_add_del_tunnel
   vlib_main_t *vm = vlib_get_main ();
   u8 hw_addr[6];
 
+  u8 multipoint = ip46_address_is_zero (&a->dst);
+  if (multipoint && (a->is_l3 ||
+                     (a->decap_next_index != ~0 &&
+                      a->decap_next_index != VXLAN_INPUT_NEXT_L2_INPUT)))
+    return VNET_API_ERROR_UNIMPLEMENTED;
+  if (ip46_address_is_zero (&a->src) ||
+      ip46_address_is_multicast (&a->src) || !a->vni || a->vni >> 24)
+    return VNET_API_ERROR_INVALID_VALUE;
+
   /* Set udp-ports */
   if (a->src_port == 0)
     a->src_port = is_ip6 ? UDP_DST_PORT_vxlan6 : UDP_DST_PORT_vxlan;
@@ -383,13 +395,14 @@ int vnet_vxlan_add_del_tunnel
     }
   else
     {
-      key6.key[0] = a->dst.ip6.as_u64[0];
-      key6.key[1] = a->dst.ip6.as_u64[1];
+      key6.key[0] = multipoint ? a->src.ip6.as_u64[0] : a->dst.ip6.as_u64[0];
+      key6.key[1] = multipoint ? a->src.ip6.as_u64[1] : a->dst.ip6.as_u64[1];
       key6.key[2] = (((u64) clib_host_to_net_u16 (a->src_port) << 48) |
 		     ((u64) a->encap_fib_index) << 32) |
 		    clib_host_to_net_u32 (a->vni << 8);
       not_found =
-	clib_bihash_search_inline_24_8 (&vxm->vxlan6_tunnel_by_key, &key6);
+        clib_bihash_search_inline_24_8 (multipoint ? &vxm->vxlan6_mp_tunnel_by_key :
+                                                  &vxm->vxlan6_tunnel_by_key, &key6);
       p = (void *) &key6.value;
     }
 
@@ -415,6 +428,8 @@ int vnet_vxlan_add_del_tunnel
       vxlan_tunnel_t *t;
       pool_get_aligned (vxm->tunnels, t, CLIB_CACHE_LINE_BYTES);
       clib_memset (t, 0, sizeof (*t));
+      t->multipoint = multipoint;
+      t->next_dpo = (dpo_id_t) DPO_INVALID;
       dev_instance = t - vxm->tunnels;
 
       /* copy from arg structure */
@@ -469,6 +484,8 @@ int vnet_vxlan_add_del_tunnel
       /* Set vxlan tunnel output node */
       u32 encap_index = !is_ip6 ?
 	vxlan4_encap_node.index : vxlan6_encap_node.index;
+      if (multipoint)
+        encap_index = vxlan4_mp_encap_node.index;
       vnet_set_interface_output_node (vnm, t->hw_if_index, encap_index);
 
       t->sw_if_index = sw_if_index = hi->sw_if_index;
@@ -478,7 +495,7 @@ int vnet_vxlan_add_del_tunnel
       if (is_ip6)
 	{
 	  key6.value = (u64) dev_instance;
-	  add_failed = clib_bihash_add_del_24_8 (&vxm->vxlan6_tunnel_by_key,
+	  add_failed = clib_bihash_add_del_24_8 (multipoint ? &vxm->vxlan6_mp_tunnel_by_key : &vxm->vxlan6_tunnel_by_key,
 						 &key6, 1 /*add */ );
 	}
       else
@@ -524,7 +541,12 @@ int vnet_vxlan_add_del_tunnel
 
       fib_protocol_t fp = fib_ip_proto (is_ip6);
       fib_prefix_from_ip46_addr (fp, &t->dst, &tun_dst_pfx);
-      if (!ip46_address_is_multicast (&t->dst))
+      if (multipoint)
+        {
+          vtep_addr_ref (&vxm->vtep_table, t->encap_fib_index, &t->src);
+          fib_table_lock (t->encap_fib_index, fp, FIB_SOURCE_RR);
+        }
+      else if (!ip46_address_is_multicast (&t->dst))
 	{
 	  /* Unicast tunnel -
 	   * source the FIB entry for the tunnel's destination
@@ -630,7 +652,7 @@ int vnet_vxlan_add_del_tunnel
 	clib_bihash_add_del_16_8 (&vxm->vxlan4_tunnel_by_key, &key4,
 				  0 /*del */ );
       else
-	clib_bihash_add_del_24_8 (&vxm->vxlan6_tunnel_by_key, &key6,
+	clib_bihash_add_del_24_8 (multipoint ? &vxm->vxlan6_mp_tunnel_by_key : &vxm->vxlan6_tunnel_by_key, &key6,
 				  0 /*del */ );
 
       if (!ip46_address_is_multicast (&t->dst))
@@ -639,7 +661,16 @@ int vnet_vxlan_add_del_tunnel
 	    vnet_flow_del (vnm, t->flow_index);
 
 	  vtep_addr_unref (&vxm->vtep_table, t->encap_fib_index, &t->src);
-	  fib_entry_untrack (t->fib_entry_index, t->sibling_index);
+          if (t->multipoint)
+            {
+              hash_free (t->remote_by_mac);
+              pool_free (t->remote_ips);
+              vec_free (t->flood_remotes);
+              fib_table_unlock (t->encap_fib_index, fib_ip_proto (is_ip6),
+                                FIB_SOURCE_RR);
+            }
+          else
+            fib_entry_untrack (t->fib_entry_index, t->sibling_index);
 	}
       else if (vtep_addr_unref (&vxm->vtep_table,
 				t->encap_fib_index, &t->dst) == 0)
@@ -806,8 +837,8 @@ vxlan_add_del_tunnel_command_fn (vlib_main_t * vm,
   if (src_set == 0)
     return clib_error_return (0, "tunnel src address not specified");
 
-  if (dst_set == 0)
-    return clib_error_return (0, "tunnel dst address not specified");
+  if (dst_set == 0 && is_l3)
+    return clib_error_return (0, "source-only VXLAN requires Ethernet payload");
 
   if (grp_set && !ip46_address_is_multicast (&dst))
     return clib_error_return (0, "tunnel group address not multicast");
@@ -904,7 +935,7 @@ VLIB_CLI_COMMAND (create_vxlan_tunnel_command, static) = {
   .path = "create vxlan tunnel",
   .short_help =
     "create vxlan tunnel src <local-vtep-addr>"
-    " {dst <remote-vtep-addr>|group <mcast-vtep-addr> <intf-name>} vni <nn>"
+    " [dst <remote-vtep-addr>|group <mcast-vtep-addr> <intf-name>] vni <nn>"
     " [instance <id>]"
     " [encap-vrf-id <nn>] [decap-next [l2|node <name>]] [del] [l3]"
     " [src_port <local-vtep-udp-port>] [dst_port <remote-vtep-udp-port>]",
@@ -1164,6 +1195,10 @@ vnet_vxlan_add_del_rx_flow (u32 hw_if_index, u32 t_index, int is_add)
 {
   vxlan_main_t *vxm = &vxlan_main;
   vxlan_tunnel_t *t = pool_elt_at_index (vxm->tunnels, t_index);
+  /* This legacy rule is an exact IPv4 src/dst match and cannot describe a
+   * source-only VNI. Keep multipoint traffic on the validated input path. */
+  if (t->multipoint || !ip46_address_is_ip4 (&t->src))
+    return VNET_API_ERROR_UNIMPLEMENTED;
   vnet_main_t *vnm = vnet_get_main ();
   if (is_add)
     {
@@ -1301,6 +1336,8 @@ vxlan_init (vlib_main_t * vm)
 			 VXLAN_HASH_NUM_BUCKETS, VXLAN_HASH_MEMORY_SIZE);
   clib_bihash_init_24_8 (&vxm->vxlan6_tunnel_by_key, "vxlan6",
 			 VXLAN_HASH_NUM_BUCKETS, VXLAN_HASH_MEMORY_SIZE);
+  clib_bihash_init_24_8 (&vxm->vxlan6_mp_tunnel_by_key, "vxlan6-multipoint",
+                       VXLAN_HASH_NUM_BUCKETS, VXLAN_HASH_MEMORY_SIZE);
   vxm->vtep_table = vtep_table_create ();
   vxm->mcast_shared = hash_create_mem (0,
 				       sizeof (ip46_address_t),

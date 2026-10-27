@@ -123,6 +123,13 @@ typedef struct
   u32 dev_instance;		/* Real device instance in tunnel vector */
   u32 user_instance;		/* Instance name being shown to user */
 
+  /* A source-only IPv4 interface has no per-remote tunnel instances.
+   * MAC -> remote VTEP and independent IMET replication destinations. */
+  u8 multipoint;
+  uword *remote_by_mac;
+  ip46_address_t *remote_ips;
+  ip46_address_t *flood_remotes;
+
   VNET_DECLARE_REWRITE;
 } vxlan_tunnel_t;
 
@@ -156,6 +163,7 @@ typedef struct
     vxlan4_tunnel_by_key; /* keyed on ipv4.dst + src_port + fib + vni */
   clib_bihash_24_8_t
     vxlan6_tunnel_by_key; /* keyed on ipv6.dst + src_port + fib + vni */
+  clib_bihash_24_8_t vxlan6_mp_tunnel_by_key; /* local IPv6 + port + fib + VNI */
 
   /* local VTEP IPs ref count used by vxlan-bypass node to check if
      received VXLAN packet DIP matches any local VTEP address */
@@ -190,6 +198,10 @@ extern vlib_node_registration_t vxlan4_input_node;
 extern vlib_node_registration_t vxlan6_input_node;
 extern vlib_node_registration_t vxlan4_encap_node;
 extern vlib_node_registration_t vxlan6_encap_node;
+extern vlib_node_registration_t vxlan4_mp_encap_node;
+
+int vxlan_mp_remote_update (u32 sw_if_index, const u8 *mac,
+                            ip46_address_t remote, u8 bum, u8 is_add);
 extern vlib_node_registration_t vxlan4_flow_input_node;
 
 u8 *format_vxlan_encap_trace (u8 * s, va_list * args);

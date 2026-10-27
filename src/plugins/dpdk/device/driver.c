@@ -79,6 +79,9 @@ static dpdk_driver_t dpdk_drivers[] = {
     .interface_number_from_port_id = 1,
   },
   {
+    .drivers = DPDK_DRIVERS ({ "net_hinic3", "Huawei HiNIC3 PF/VF" }),
+  },
+  {
     .drivers = DPDK_DRIVERS ({ "net_mlx4", "Mellanox ConnectX-3 Family" },
 			     { "net_qede", "Cavium QLogic FastLinQ QL4xxxx" },
 			     { "net_bnxt", "Broadcom NetXtreme E/S-Series" }),

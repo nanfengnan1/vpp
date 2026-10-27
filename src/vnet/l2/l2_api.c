@@ -31,6 +31,49 @@
 #include <vlibapi/api_helper_macros.h>
 
 static void
+vl_api_l2_egress_flood_t_handler (vl_api_l2_egress_flood_t *mp)
+{
+  vl_api_l2_egress_flood_reply_t *rmp;
+  int rv = 0;
+  u8 flood_class = 0;
+  VALIDATE_SW_IF_INDEX (mp);
+  u32 sw_if_index = ntohl (mp->sw_if_index);
+  if (sw_if_index >= vec_len (l2input_main.configs) ||
+      !l2_input_is_bridge (&l2input_main.configs[sw_if_index]))
+    {
+      rv = VNET_API_ERROR_INVALID_SW_IF_INDEX;
+      goto bad_sw_if_index;
+    }
+  vnet_sw_interface_t *si = vnet_get_sw_interface (vnet_get_main (), sw_if_index);
+  flood_class = si->flood_class;
+  if (mp->is_set && flood_class != mp->flood_class)
+    {
+      if ((mp->flood_class != VNET_FLOOD_CLASS_NORMAL &&
+           mp->flood_class != VNET_FLOOD_CLASS_TUNNEL_NORMAL &&
+           mp->flood_class != VNET_FLOOD_CLASS_NO_FLOOD) ||
+          flood_class == VNET_FLOOD_CLASS_BVI ||
+          flood_class == VNET_FLOOD_CLASS_TUNNEL_MASTER)
+        {
+          rv = VNET_API_ERROR_INVALID_VALUE;
+          goto bad_sw_if_index;
+        }
+      l2_input_config_t *cfg = &l2input_main.configs[sw_if_index];
+      l2_bridge_domain_t *bd = &l2input_main.bd_configs[cfg->bd_index];
+      l2_flood_member_t member = { .sw_if_index = sw_if_index, .shg = cfg->shg };
+      if (bd_remove_member (bd, sw_if_index))
+        {
+          rv = VNET_API_ERROR_INVALID_VALUE;
+          goto bad_sw_if_index;
+        }
+      si->flood_class = mp->flood_class;
+      bd_add_member (bd, &member);
+      flood_class = si->flood_class;
+    }
+  BAD_SW_IF_INDEX_LABEL;
+  REPLY_MACRO2 (VL_API_L2_EGRESS_FLOOD_REPLY, ({ rmp->flood_class = flood_class; }));
+}
+
+static void
 send_l2_xconnect_details (vl_api_registration_t * reg, u32 context,
 			  u32 rx_sw_if_index, u32 tx_sw_if_index)
 {

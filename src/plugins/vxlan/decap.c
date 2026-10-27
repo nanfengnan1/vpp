@@ -86,6 +86,18 @@ vxlan4_find_tunnel (vxlan_main_t * vxm, last_tunnel_cache4 * cache,
       return di;
     }
 
+  /* Source-only interface: local VTEP + port + underlay FIB + VNI.
+   * Do not cache under the wildcard key as the next packet may have a
+   * matching fixed-destination tunnel. Exact tunnels retain precedence. */
+  key4.key[0] = (u64) dst << 32;
+  rv = clib_bihash_search_inline_16_8 (&vxm->vxlan4_tunnel_by_key, &key4);
+  if (rv == 0)
+    {
+      vxlan_decap_info_t di = { .as_u64 = key4.value };
+      *stats_sw_if_index = di.sw_if_index;
+      return di;
+    }
+
   /* try multicast */
   if (PREDICT_TRUE (!ip4_address_is_multicast (&ip4_0->dst_address)))
     return decap_not_found;
@@ -112,6 +124,23 @@ vxlan4_find_tunnel (vxlan_main_t * vxm, last_tunnel_cache4 * cache,
 typedef vxlan6_tunnel_key_t last_tunnel_cache6;
 
 always_inline vxlan_decap_info_t
+vxlan6_find_mp (vxlan_main_t *vxm, u32 fib_index, ip6_header_t *ip6,
+                vxlan_header_t *vxlan, u32 *stats)
+{
+  udp_header_t *udp = ip6_next_header (ip6);
+  vxlan6_tunnel_key_t key = {
+    .key = { ip6->dst_address.as_u64[0], ip6->dst_address.as_u64[1],
+             ((u64) udp->dst_port << 48) | ((u64) fib_index << 32) | vxlan->vni_reserved }
+  };
+  if (clib_bihash_search_inline_24_8 (&vxm->vxlan6_mp_tunnel_by_key, &key))
+    return decap_not_found;
+  vxlan_tunnel_t *t = pool_elt_at_index (vxm->tunnels, key.value);
+  *stats = t->sw_if_index;
+  return (vxlan_decap_info_t) { .sw_if_index = t->sw_if_index,
+                               .next_index = t->decap_next_index };
+}
+
+always_inline vxlan_decap_info_t
 vxlan6_find_tunnel (vxlan_main_t * vxm, last_tunnel_cache6 * cache,
 		    u32 fib_index, ip6_header_t * ip6_0,
 		    vxlan_header_t * vxlan0, u32 * stats_sw_if_index)
@@ -135,7 +164,7 @@ vxlan6_find_tunnel (vxlan_main_t * vxm, last_tunnel_cache6 * cache,
       int rv =
 	clib_bihash_search_inline_24_8 (&vxm->vxlan6_tunnel_by_key, &key6);
       if (PREDICT_FALSE (rv != 0))
-	return decap_not_found;
+        return vxlan6_find_mp (vxm, fib_index, ip6_0, vxlan0, stats_sw_if_index);
 
       *cache = key6;
     }
@@ -148,7 +177,7 @@ vxlan6_find_tunnel (vxlan_main_t * vxm, last_tunnel_cache6 * cache,
     {
       /* try multicast */
       if (PREDICT_TRUE (!ip6_address_is_multicast (&ip6_0->dst_address)))
-	return decap_not_found;
+        return vxlan6_find_mp (vxm, fib_index, ip6_0, vxlan0, stats_sw_if_index);
 
       /* Make sure mcast VXLAN tunnel exist by packet DIP and VNI */
       key6.key[0] = ip6_0->dst_address.as_u64[0];
@@ -167,6 +196,33 @@ vxlan6_find_tunnel (vxlan_main_t * vxm, last_tunnel_cache6 * cache,
     .next_index = t0->decap_next_index,
   };
   return di;
+}
+
+/* DPDK's generic L4 flags may describe the inner transport checksum.
+ * Validate the outer UDP independently, then discard outer checksum evidence
+ * before the inner packet enters L2/IP processing. */
+always_inline u8
+vxlan_outer_checksum (vlib_main_t *vm, vlib_buffer_t *b, u8 is_ip4)
+{
+  i16 saved = b->current_data;
+  int hlen = sizeof (udp_header_t) + (is_ip4 ? sizeof (ip4_header_t) : sizeof (ip6_header_t));
+  vlib_buffer_advance (b, -hlen);
+  void *ip = vlib_buffer_get_current (b);
+  udp_header_t *udp = (void *)((u8 *)ip + hlen - sizeof (udp_header_t));
+  b->flags &= ~(VNET_BUFFER_F_L4_CHECKSUM_COMPUTED | VNET_BUFFER_F_L4_CHECKSUM_CORRECT);
+  u8 good;
+  if (!udp->checksum) good = is_ip4;
+  else
+    {
+      u32 flags = is_ip4 ? ip4_tcp_udp_validate_checksum (vm, b) :
+                          ip6_tcp_udp_icmp_validate_checksum (vm, b);
+      good = !!(flags & VNET_BUFFER_F_L4_CHECKSUM_CORRECT);
+    }
+  vlib_buffer_advance (b, saved - b->current_data);
+  b->flags &= ~(VNET_BUFFER_F_L4_CHECKSUM_COMPUTED | VNET_BUFFER_F_L4_CHECKSUM_CORRECT |
+                VNET_BUFFER_F_IS_IP4 | VNET_BUFFER_F_IS_IP6 |
+                VNET_BUFFER_F_L3_HDR_OFFSET_VALID | VNET_BUFFER_F_L4_HDR_OFFSET_VALID);
+  return good;
 }
 
 always_inline uword
@@ -223,6 +279,8 @@ vxlan_input (vlib_main_t * vm,
 	  ip6_1 = cur1 - sizeof (udp_header_t) - sizeof (ip6_header_t);
 	}
 
+      u8 checksum0 = vxlan_outer_checksum (vm, b[0], is_ip4);
+      u8 checksum1 = vxlan_outer_checksum (vm, b[1], is_ip4);
       /* pop vxlan */
       vlib_buffer_advance (b[0], sizeof *vxlan0);
       vlib_buffer_advance (b[1], sizeof *vxlan1);
@@ -241,6 +299,8 @@ vxlan_input (vlib_main_t * vm,
       clib_prefetch_load (b[2]->data);
       clib_prefetch_load (b[3]->data);
 
+      if (!checksum0) di0 = (vxlan_decap_info_t) { .sw_if_index = ~0, .next_index = VXLAN_INPUT_NEXT_DROP, .error = VXLAN_ERROR_BAD_UDP_CHECKSUM };
+      if (!checksum1) di1 = (vxlan_decap_info_t) { .sw_if_index = ~0, .next_index = VXLAN_INPUT_NEXT_DROP, .error = VXLAN_ERROR_BAD_UDP_CHECKSUM };
       u32 len0 = vlib_buffer_length_in_chain (vm, b[0]);
       u32 len1 = vlib_buffer_length_in_chain (vm, b[1]);
 
@@ -327,6 +387,7 @@ vxlan_input (vlib_main_t * vm,
       else
 	ip6_0 = cur0 - sizeof (udp_header_t) - sizeof (ip6_header_t);
 
+      u8 checksum0 = vxlan_outer_checksum (vm, b[0], is_ip4);
       /* pop (ip, udp, vxlan) */
       vlib_buffer_advance (b[0], sizeof (*vxlan0));
 
@@ -336,6 +397,7 @@ vxlan_input (vlib_main_t * vm,
 	vxlan4_find_tunnel (vxm, &last4, fi0, ip4_0, vxlan0, &stats_if0) :
 	vxlan6_find_tunnel (vxm, &last6, fi0, ip6_0, vxlan0, &stats_if0);
 
+      if (!checksum0) di0 = (vxlan_decap_info_t) { .sw_if_index = ~0, .next_index = VXLAN_INPUT_NEXT_DROP, .error = VXLAN_ERROR_BAD_UDP_CHECKSUM };
       uword len0 = vlib_buffer_length_in_chain (vm, b[0]);
 
       next[0] = di0.next_index;

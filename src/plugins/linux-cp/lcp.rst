@@ -5,6 +5,13 @@
 Linux Control Plane Integration
 ===============================
 
+This fork also contains an SDN Agent EVPN adapter. See
+:doc:`/developer/extras/sdn_agent` for its separate Linux control mirrors,
+tenant BD/BVI/FIB handling and symmetric IRB forwarding, and
+:doc:`/usecases/sdn_agent` for usage. Generic LCP alone does not implement
+that EVPN object synchronization. Its tenant BVI path also has different
+ARP/ND/ping ownership from the general recommendations below.
+
 Overview
 ________
 

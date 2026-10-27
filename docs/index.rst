@@ -57,6 +57,7 @@ For more details click on the links below or press next.
    usecases/home_gateway
    usecases/acls
    usecases/networksim
+   usecases/sdn_agent
    usecases/webapp
    usecases/container_test
    usecases/trafficgen

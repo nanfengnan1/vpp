@@ -15,11 +15,32 @@
  * limitations under the License.
  */
 
-option version = "3.3.0";
+option version = "3.4.0";
 
 import "vnet/ip/ip_types.api";
 import "vnet/ethernet/ethernet_types.api";
 import "vnet/interface_types.api";
+
+/** \brief Read or change a bridge member's egress flood class.
+ * Unlike the ingress FLOOD feature, this controls replication TO this port.
+ * EVPN may retain a Type-2 unicast tunnel after its Type-3 membership is gone.
+ * Supported set values: 1=normal, 3=normal tunnel, 4=no flood.
+ * BVI and multicast-master transitions are deliberately not accepted.
+ */
+define l2_egress_flood
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  bool is_set;
+  u8 flood_class;
+};
+define l2_egress_flood_reply
+{
+  u32 context;
+  i32 retval;
+  u8 flood_class;
+};
 
 /** \brief Reply to l2_xconnect_dump
     @param context - sender context which was passed in the request

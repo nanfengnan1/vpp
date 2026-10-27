@@ -1631,6 +1631,49 @@ api_l2_interface_feat_flags_set (vat_main_t *vam)
   return ret;
 }
 
+static void
+vl_api_l2_egress_flood_reply_t_handler (vl_api_l2_egress_flood_reply_t *mp)
+{
+  vat_main_t *vam = l2_test_main.vat_main;
+  i32 retval = ntohl (mp->retval);
+  if (vam->async_mode)
+    vam->async_errors += (retval < 0);
+  else
+    {
+      vam->retval = retval;
+      if (!retval)
+        fformat (vam->ofp, "flood-class: %u\n", mp->flood_class);
+      vam->result_ready = 1;
+    }
+}
+
+static int
+api_l2_egress_flood (vat_main_t *vam)
+{
+  vl_api_l2_egress_flood_t *mp;
+  u32 sw_if_index = ~0, flood_class = 0;
+  u8 is_set = 0;
+  int ret;
+  while (unformat_check_input (vam->input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (vam->input, "sw_if_index %u", &sw_if_index))
+        ;
+      else if (unformat (vam->input, "class %u", &flood_class))
+        is_set = 1;
+      else
+        return -99;
+    }
+  if (sw_if_index == ~0 || flood_class > 4)
+    return -99;
+  M (L2_EGRESS_FLOOD, mp);
+  mp->sw_if_index = htonl (sw_if_index);
+  mp->flood_class = flood_class;
+  mp->is_set = is_set;
+  S (mp);
+  W (ret);
+  return ret;
+}
+
 #include <vnet/l2/l2.api_test.c>
 
 /*

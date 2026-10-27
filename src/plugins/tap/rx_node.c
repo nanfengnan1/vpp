@@ -151,10 +151,30 @@ tap_rx_offloads (vlib_buffer_t *b0, vnet_virtio_net_hdr_v1_t *hdr, int is_tun)
     }
   else if (PREDICT_TRUE (ethertype == ETHERNET_TYPE_IP6))
     {
+      if (off + b0->current_length < l2hdr_sz + sizeof (ip6_header_t))
+	return;
       ip6_header_t *ip6 = (ip6_header_t *) (data + l2hdr_sz);
-      vnet_buffer (b0)->l4_hdr_offset = l2hdr_sz + sizeof (ip6_header_t);
-      /* FIXME IPv6 EH traversal */
+      u32 offset = l2hdr_sz + sizeof (ip6_header_t);
       l4_proto = ip6->protocol;
+      /* NEEDS_CSUM describes the transport header, which may follow an
+       * IPv6 extension chain. Preserve this request for tunnel output. */
+      for (u32 depth = 0; l4_proto == 0 || l4_proto == 43 ||
+			 l4_proto == 60 || l4_proto == 51; depth++)
+	{
+	  if (depth == 8 || off + b0->current_length < offset + 8)
+	    return;
+	  u8 *ext = data + offset;
+	  u32 size = l4_proto == 51 ? (ext[1] + 2) * 4 : (ext[1] + 1) * 8;
+	  if (off + b0->current_length < offset + size)
+	    return;
+	  l4_proto = ext[0];
+	  offset += size;
+	}
+      if (offset != off + hdr->csum_start ||
+	  (l4_proto == IP_PROTOCOL_TCP && off + b0->current_length < offset + sizeof (tcp_header_t)) ||
+	  (l4_proto == IP_PROTOCOL_UDP && off + b0->current_length < offset + sizeof (udp_header_t)))
+	return;
+      vnet_buffer (b0)->l4_hdr_offset = offset;
       b0->flags |= (VNET_BUFFER_F_IS_IP6 | VNET_BUFFER_F_L2_HDR_OFFSET_VALID |
 		    VNET_BUFFER_F_L3_HDR_OFFSET_VALID |
 		    VNET_BUFFER_F_L4_HDR_OFFSET_VALID);

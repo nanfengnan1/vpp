@@ -13,10 +13,70 @@
  * limitations under the License.
  */
 
-option version = "2.1.0";
+option version = "2.3.0";
 
 import "vnet/interface_types.api";
 import "vnet/ip/ip_types.api";
+import "vnet/ethernet/ethernet_types.api";
+
+/** Source-only Ethernet VXLAN uses dst_address=0.0.0.0 in v3 create.
+ * One interface per local IPv4 VTEP/VNI; these entries allocate no interfaces.
+ * bum=true requires zero MAC. MAC replacement is atomic; delete compares remote.
+ */
+autoreply define vxlan_mp_remote_add_del
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  vl_api_mac_address_t mac;
+  vl_api_ip4_address_t remote;
+  bool bum;
+  bool is_add [default=true];
+};
+
+define vxlan_mp_remote_dump
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index [default=0xffffffff];
+};
+
+define vxlan_mp_remote_details
+{
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  vl_api_mac_address_t mac;
+  vl_api_ip4_address_t remote;
+  bool bum;
+};
+
+/** Dual-stack remote mappings; remote must have the local VTEP's family. */
+autoreply define vxlan_mp_remote_add_del_v2
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  vl_api_mac_address_t mac;
+  vl_api_address_t remote;
+  bool bum;
+  bool is_add [default=true];
+};
+
+define vxlan_mp_remote_v2_dump
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index [default=0xffffffff];
+};
+
+define vxlan_mp_remote_v2_details
+{
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  vl_api_mac_address_t mac;
+  vl_api_address_t remote;
+  bool bum;
+};
 
 /** \brief Create or delete a VXLAN tunnel
     @param client_index - opaque cookie to identify the sender
