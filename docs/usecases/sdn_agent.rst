@@ -23,6 +23,62 @@ VPP 负责租户二层和三层转发。已验收基线是本地 VPP 26.06 与 F
   :doc:`/developer/plugins/lcp`。Agent 的完整操作码与启动参数见其
   docs/user/vpp.rst、docs/developer/vpp.rst。
 
+.. _sdn_vxlan_user_modes:
+
+与原版 VXLAN 的使用差异
+----------------------------------------
+
+原版 VPP 已支持 IPv4/IPv6 VXLAN 和 group 组播隧道。本 fork 新增源地址型多点
+Ethernet VXLAN：在同一本地 VTEP、Underlay FIB、端口上下文中，一个 VNI 接口
+承载多个远端。封装格式仍是标准 VXLAN，详细对比和架构见
+:ref:`sdn_vxlan_comparison`、:ref:`sdn_vxlan_native_pipeline`。
+
+.. list-table:: 三种接口使用方式
+   :header-rows: 1
+   :widths: 20 40 40
+
+   * - 模式
+     - 外层目的与复制方式
+     - 当前 Agent 支持情况
+   * - 原有固定 dst
+     - 一个单播隧道接口指向固定远端；多个远端可建立多个接口。
+     - VPP 原生能力保留；本适配器的受管 VXLAN 使用多点模型。
+   * - 原有 group
+     - 外层发往组播地址，由 Underlay 组播网络复制。
+     - VPP 原生能力保留；Agent 尚无 group 配置、同步和回滚支持。
+   * - 新增源地址型多点
+     - 内层目的 MAC 决定远端；BUM 在本地按成员列表做单播入口复制。
+     - 当前受管方式，由 FRR 有效状态驱动 MAC→VTEP 和 BUM 成员更新。
+
+以下是原生 CLI 语义对照，供独立测试环境使用，不是完整的组网配置。
+不要用它们修改已经由 Agent 管理的同一对象。GigabitEthernet0/8/0 仅为接口名示例。
+
+.. code-block:: text
+
+   固定远端：
+   create vxlan tunnel src 10.255.0.11 dst 10.255.0.12 vni 10010
+
+   Underlay 组播：
+   create vxlan tunnel src 10.255.0.11 group 239.1.1.1 GigabitEthernet0/8/0 vni 10010
+
+   本 fork 的多点接口：
+   create vxlan tunnel src 10.255.0.11 vni 10010
+   set vxlan remote <创建返回的接口名> remote 10.255.0.12 mac 02:00:00:10:00:12
+   set vxlan remote <创建返回的接口名> remote 10.255.0.12 bum
+
+手动添加远端映射并不代替 BD 成员绑定、BD FDB 和 Underlay 可达性配置。
+在 Agent 模式中，这些相关状态由配置操作和适配器协调。VPP 接口名、逻辑名称、
+sw_if_index 和 VNI 是不同标识，查询结果会给出它们的对应关系。
+
+当前学习和普通业务环境无需启用 group。即使租户业务包含广播或组播，也可以通过
+入口复制传输；只有实测的 BUM 复制开销或明确的组播网络需求，才值得扩展该模式。
+创建 group 隧道本身不会配置整个 Underlay 的组播成员和转发，决策依据见
+:ref:`sdn_vxlan_bum_modes`。
+
+多点接口可以先于 EVPN 远端出现，最后一个远端撤销后接口仍保留。
+Type-2 单播映射和 Type-3 BUM 成员独立管理；跨网段采用 Ethernet L3VNI 和
+Router MAC，对称 IRB 的基础 BD/BVI/FIB 能力并非本次才引入。
+
 构建时选择版本
 --------------
 

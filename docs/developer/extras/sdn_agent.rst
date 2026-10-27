@@ -11,23 +11,110 @@ SDN Agent 适配架构与开发
    :local:
    :depth: 3
 
+.. _sdn_vxlan_comparison:
+
+原版 VXLAN 与当前实现的差异
+----------------------------------------
+
+对比基线为本仓库 VPP 26.06 的 ``c3200b88d``；适配实现首次提交为
+``2814bd686``。这里的“原版”指该基线的 VXLAN 插件，不代表 VPP 其他插件或
+外部控制器不能组合出 EVPN/IRB 功能。原版已经支持 IPv4/IPv6 外层、固定远端
+和组播隧道；本次增加源地址型多点 Ethernet VXLAN 及 SDN Agent 适配链路。
+线上仍是标准 VXLAN 封装，新增接口模型没有增加私有报文字段。
+
+.. list-table:: 配置与转发模型对比
+   :header-rows: 1
+   :widths: 18 38 44
+
+   * - 项目
+     - 原版固定远端 / 组播模式
+     - 当前新增多点模式与适配器
+   * - 接口模型
+     - 单播接口对应固定本地 VTEP、远端 VTEP、VNI 等参数；组播模式另配置 group。
+     - 同一本地 VTEP、Underlay FIB 和 UDP 端口上下文中，每个 VNI 一个多点接口。
+   * - 创建条件
+     - CLI 要求 src 和 dst，或 src 和 group/接口。
+     - 只提供 src 和 VNI 即可建立接口；Binary API 的 dst 使用对应地址族的未指定地址。
+   * - 单播远端选择
+     - BD 的 FDB 选择隧道接口，接口的固定 dst 决定外层目的 IP。
+     - BD 的 FDB 先选择多点接口，再由接口内部的 MAC→VTEP 表选择外层目的 IP。
+   * - BUM 复制
+     - BD 可向多个单播隧道复制；也可通过组播隧道交给 Underlay 复制。
+     - 多点接口内部维护 BUM 成员列表，向各远端做单播入口复制。
+   * - 远端生命周期
+     - 外部控制程序维护对应的隧道接口和 FDB。
+     - 添加、移动、撤销远端主要更新表项；远端列表为空时仍保留接口。
+   * - IPv4/IPv6
+     - 两种外层地址族均已支持。
+     - 新的多点接口及 v2 远端 API 也支持双栈；远端地址族必须与本地 VTEP 一致。
+   * - Underlay 转发
+     - 使用固定封装头及跟踪远端路由、重栈的 next_dpo。
+     - 选择远端后构造封装头，设置 encap_fib_index，进入 ip4-lookup/ip6-lookup。
+   * - 接收查找
+     - 按配置的远端及本地端点、VNI、UDP 端口和 Underlay FIB 匹配。
+     - 保留固定隧道优先级；未命中时再按本地 VTEP、VNI、端口/FIB 查多点接口。
+   * - EVPN 控制面
+     - VXLAN 插件本身不运行 BGP，也不负责消费 FRR 的 EVPN 路由。
+     - 新增适配器消费 Zebra 安装到 Linux 的有效状态；BGP/EVPN 选路仍由 FRR 完成。
+   * - 对称 IRB
+     - VPP 已有 BD、BVI、FIB 等基础对象，需要外部配置组合。
+     - irb.py 组织租户 FIB、业务/传输 BD/BVI、Router MAC 和 L3VNI 相关路由。
+   * - GSO 与校验和
+     - 原有封装节点已有软件校验和及卸载标记处理。
+     - 多点路径增加 TCP GSO 软件分段和校验和补全；解封装独立校验外层 UDP。
+
+同一个 VNI 有两个远端时，接口和转发表组织如下。vx10010 是逻辑名称示例，
+实际 VPP 接口名和 sw_if_index 以查询结果为准。
+
+.. code-block:: text
+
+   固定远端单播模式：本地 10.255.0.11，VNI 10010
+
+   br10 -- vxlan_tunnel0 -- dst 10.255.0.12
+        \- vxlan_tunnel1 -- dst 10.255.0.13
+
+   BD FDB: MAC-A -> vxlan_tunnel0
+           MAC-B -> vxlan_tunnel1
+
+   新增多点模式：本地 10.255.0.11，VNI 10010
+
+   br10 -- vx10010 -- MAC-A -> 10.255.0.12
+                  |  MAC-B -> 10.255.0.13
+                  \- BUM   -> [10.255.0.12, 10.255.0.13]
+
+   BD FDB: MAC-A -> vx10010
+           MAC-B -> vx10010
+
+VNI 不是整个进程内唯一的接口身份，必须结合本地端点、端口和 Underlay 上下文。
+每个发出的报文仍有明确的外层目的 IP；未指定 dst 是创建时的本地模型，不会把
+0.0.0.0 或 :: 当成线上目的地址。旧固定 dst 与 group 模式继续保留。
+新增多点模式仅承载 Ethernet，不支持 raw-IP ``is_l3``。
+
 控制通道与资源归属
 ------------------
 
 .. code-block:: text
 
    Web -> Controller -> gRPC -> SDN Agent
-                                |             |
-                         VPP composite     FRR Driver
-                                |             | vtysh
-                         Unix HTTP          bgpd
-                                |             | ZAPI
-                        Python adapter      Zebra
-                          |       ^           | Netlink
-                 Binary API       +-- Linux control mirrors
-                          |             VRF / bridge / VXLAN / neighbor
-                          v
-                VPP tenant FIB / BD / BVI / FDB / VXLAN
+                                  |
+                   +--------------+---------------+
+                   |                              |
+             VPP composite                    FRR Driver
+               |       |                          | vtysh
+               |       +-- Linux Driver/Undo       v
+               |                |                bgpd
+               |                v                 | ZAPI
+               |         Linux control mirrors <- Zebra
+               |         VRF/bridge/VXLAN/FDB      Netlink
+               |         neighbor/tenant routes
+               |                ^   |
+          Unix HTTP/JSON        |   | selected state
+               |        local   |   v
+               +------> Python adapter (adapter.py + irb.py)
+                        |           ^
+             Binary API |           | native readback
+                        v           |
+                  VPP tenant FIB / BD / BVI / FDB / VXLAN
 
    Underlay Linux IP state -> Netlink -> linux_nl -> VPP ordinary IP objects
    Linux protocol packets <-> TAP/TUN + LCP punt/xc <-> VPP actual interfaces
@@ -42,6 +129,9 @@ Agent composite 内部复用 Linux Undo，不能再独立注册第二个 Linux D
 运行模型为 tenant/bridge/binding/vxlan/l3vni 等对象，BD ID 与 VNI/table ID 分开。
 对象使用 sdn-agent/ ownership tag，拒绝抢占别的组件创建的资源。
 Linux 镜像 tc 双向隔离业务，underlay LCP 通道保留；VPP BVI 网关业务不经 Linux 转发。
+Python 是常驻控制进程，不参与逐包封装和复制。Agent 到适配器的 Unix socket
+默认是 /run/sdn-agent/vpp.sock；适配器用 vpp_papi 连接 /run/vpp/api.sock。
+配置提交、状态同步与业务转发分别走上述控制通道和下文的数据面路径。
 
 LCP 与图节点
 ------------
@@ -141,6 +231,96 @@ Type-2 产生远端主机路由即可完成跨网段转发。实际 VF 抓包确
 TCP GSO 在封装前软件分段；IPv6 外层 UDP 校验和必须有效；不声称硬件隧道 TSO。
 旧固定 src/dst 的 RX flow offload 规则不能套到多点接口，RX LRO 保持关闭。
 
+.. _sdn_vxlan_native_pipeline:
+
+多点接口的逐包处理与状态更新
+----------------------------------------
+
+``vxlan_tunnel_t`` 保留公共隧道参数，新增 ``multipoint`` 标志、
+``remote_by_mac`` 哈希、``remote_ips`` 地址池和 ``flood_remotes`` 列表。
+MAC 哈希的值是地址池索引，BUM 列表独立维护。``vxlan_mp_remote_update()``
+负责增删远端，``vxlan-mp-encap`` 是实际执行封装的 INTERNAL 节点。
+
+单播、BUM 与解封装
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: text
+
+   同 BD 单播：
+   access -> l2-input / BD FDB -> 多点 VXLAN 接口
+          -> vxlan-mp-encap -> 内层目的 MAC 查 remote_by_mac
+          -> 构造外层 IP/UDP/VXLAN -> underlay ip4/ip6-lookup -> 出口
+
+   BUM 或未知单播（BD 允许泛洪时）：
+   access -> BD flood -> 多点 VXLAN 接口 -> vxlan-mp-encap
+          -> flood_remotes
+               +-> 副本 1，外层 dst=远端 VTEP 1 -> underlay lookup
+               \-> 副本 2，外层 dst=远端 VTEP 2 -> underlay lookup
+
+   接收：
+   underlay -> VXLAN 输入路径 -> vxlan4-input / vxlan6-input
+            -> 校验外层 UDP、查找固定隧道或多点接口
+            -> 解封装 -> l2-input / 该接口所属 BD
+
+实际接收前置节点取决于设备插件、UDP 分发和 vxlan-bypass 配置，以上为逻辑路径。
+在多点封装节点内，已知单播命中 MAC 映射后只发给该远端；未命中或目的 MAC 为
+组播/广播时使用 BUM 列表。需要泛洪而列表为空时，报文计入 no remote VTEP 并丢弃。
+这里的 Underlay FIB 查找与租户 FIB 不同：同 BD 通信不需要先查租户路由，
+跨网段则先按前文的对称 IRB 路径完成租户路由和 Router MAC 选择。
+
+接收侧的多点查找不要求源 VTEP 已存在于发送远端表，MAC→VTEP/BUM 表不构成接收 ACL。
+外层 UDP 校验位于公共 vxlan_input 路径，旧固定远端隧道经过该路径时也会执行，
+因此本次接收侧修正不只影响新增多点接口。
+适配器给多点桥端口设置 SHG 1 并关闭该端口的数据面 MAC 学习，避免远端间反射和
+远端条目覆盖；这些策略由适配器设置，不能只创建一个裸 VXLAN 接口就假定已经具备。
+
+远端变化与兼容边界
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* Type-2 驱动单播映射，Type-3 驱动 BUM 成员，撤销其中一种不会隐式删除另一种。
+* 同一 MAC 移动到新 VTEP 时更新地址池；删除请求同时比较远端地址，旧目的的迟到
+  撤销不会删除已迁移的新映射。更新位于 worker barrier 内。
+* ``vxlan_mp_remote_add_del_v2`` / ``vxlan_mp_remote_v2_dump`` 支持双栈，
+  IPv4-only v1 API 继续保留。VXLAN API 版本为 2.3.0。
+* L2 API 3.4.0 的 ``l2_egress_flood`` 调整向桥成员复制的类别，不能与接口
+  ingress FLOOD 开关混为一谈；多点接口内部的远端列表由 VXLAN API 管理。
+* TCP GSO 在多点封装前软件分段；有 IPv6 扩展头时修正传输偏移、长度和校验和。
+  IPv6 外层 UDP 校验和必须有效。硬件隧道 TSO/LRO 不属于这次能力承诺。
+
+多点方式减少了随远端数量增长的接口对象，但增加了封装阶段的 MAC 查表和动态
+封装处理，BUM 复制仍消耗发送端 CPU、buffer 和出口带宽。未完成对照性能测试前，
+不能从接口数量减少推导吞吐提高，也不能将软件回退等同硬件卸载。
+
+.. _sdn_vxlan_bum_modes:
+
+group 与入口复制的取舍
+----------------------------------------
+
+原生 ``group`` 指定的是外层目的组播 IP 和承载接口，不是 EVPN 邻居组，也不是
+一个 VTEP 地址列表。组播隧道让发送端发出一份 BUM 封装报文，由 Underlay 复制；
+当前多点模式根据 EVPN Type-3 成员，在入口 VPP 生成逐远端的单播副本。
+
+.. code-block:: text
+
+   group 模式：
+   Leaf1 -- 外层 dst=239.1.1.1 --> Underlay 组播树 --+-> Leaf2
+                                                   \-> Leaf3
+
+   当前入口复制：
+   Leaf1 -- 副本 1，dst=10.255.0.12 --> Underlay 单播路由 --> Leaf2
+         \- 副本 2，dst=10.255.0.13 --> Underlay 单播路由 --> Leaf3
+
+组播模式依赖正确的组播转发和接收成员配置；单独创建 VPP group 隧道不会替网络
+建立完整的 PIM/IGMP/MLD 或静态组播状态。当前 Agent 的 VXLAN typed operation
+没有 group 字段，受管路径采用入口复制；保留 VPP 原生 CLI 不等于 Agent 已支持
+组播隧道的创建、核对和回滚。租户内有组播业务也不自动要求外层使用 group。
+
+现阶段继续采用入口复制，按“每个 VNI 的远端数 × BUM 流量”评估复制开销。
+当实测表明发送端复制/带宽成为瓶颈，或部署明确要求组播 Underlay 时，再扩展
+组播组分配、EVPN 隧道属性映射、成员生命周期和故障/重复报文验收。
+入口复制和组播树都是 EVPN 支持的方式，见
+`RFC 8365 第 9 节 <https://www.rfc-editor.org/rfc/rfc8365.html#section-9>`_。
+
 源码和运行时的一致性
 --------------------
 
@@ -148,7 +328,7 @@ Agent 构建的 VPP 基础镜像同时包含 native libraries、API JSON、vpp_p
 irb.py。集成镜像从同一 VPP 镜像复制它们，禁止另外叠加不同 checkout 的 Python 文件。
 FRR 从 nanfengnan1/frr 的指定 ref 构建；source.json 记录实际 commit 和工作区修改。
 Git ref 可选择不代表任意版本兼容，源码预检查会拒绝缺少本 fork API 的上游版本。
-远端完整构建待适配代码提交、推送后验证；当前不要把本地已验收镜像等同远端发布物。
+远端完整源码镜像构建仍待验证；本地代码提交和功能验收不等同指定远端 ref 构建或发布成功。
 
 维护变更时同步三个层面：C API/插件、extras/sdn-agent、配套 Agent capabilities/文档。
 修改 API 后必须重建 native 与 PAPI，不能只重启 Python。

@@ -2,6 +2,10 @@
 
 更新日期：2026-10-27。
 
+文档已补充原版 VPP 26.06（`c3200b88d`）与本 fork 多点实现（首次提交 `2814bd686`）的差异：见[开发文档对比与架构](docs/developer/extras/sdn_agent.rst)和[用户模式选择](docs/usecases/sdn_agent.rst)。明确原版已有双栈/组播能力、新增 MAC→VTEP 与 BUM 独立表、控制面同步和逐包路径，以及保留原生 `group`、当前 Agent 采用入口复制的边界。
+
+本次文档验证使用 Sphinx `-n -W --keep-going` 定向构建开发页、用户页和真实 LCP 页面，检查比较章节、处理流程和跨页锚点；不代表整套 VPP 手册或数据面代码重新编译、测试通过。
+
 本文记录本 fork 的当前实现、组件边界、构建方式和后续方向。代码位置与详细说明见 [适配开发文档](docs/developer/extras/sdn_agent.rst)、[使用指南](docs/usecases/sdn_agent.rst) 和 [Python 适配器说明](extras/sdn-agent/README.md)。配套 `sdn-agent` 仓库的 `docs/developer/vpp.rst` 包含完整节点表、操作与实验步骤。
 
 ## 1. 当前实现结论
@@ -10,7 +14,7 @@
 - **当前通信路径是 Go Agent → Python 适配进程 → VPP Binary API → VPP 核心及 C 插件。没有专门的 `sdn_agent_plugin.so` 直接连接 Agent。**
 - Python 是常驻控制进程，负责资源映射、事务配合和状态核对；逐包查表、封装、解封装、GSO 软件分段在 VPP 原生代码中执行。
 - FRR 通过 Linux 控制面对象感知接口、VRF、VNI、MAC/IP；Linux 镜像与 VPP 转发表由适配层协调。
-- 已验证基线为本地适配源码 VPP 26.06 / FRR 10.7.0。GitHub 适配代码尚待提交、推送，完整远端源码镜像构建待验证。
+- 已验证基线为本地适配源码 VPP 26.06 / FRR 10.7.0；本地适配实现已提交为 `2814bd686`，完整远端源码镜像构建仍待验证。
 
 ## 2. 控制架构与通信边界
 
