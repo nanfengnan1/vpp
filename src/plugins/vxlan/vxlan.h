@@ -200,6 +200,8 @@ extern vlib_node_registration_t vxlan4_encap_node;
 extern vlib_node_registration_t vxlan6_encap_node;
 extern vlib_node_registration_t vxlan4_mp_encap_node;
 
+int vnet_vxlan_set_encap_vrf (u32 sw_if_index, u32 table_id);
+
 int vxlan_mp_remote_update (u32 sw_if_index, const u8 *mac,
                             ip46_address_t remote, u8 bum, u8 is_add);
 extern vlib_node_registration_t vxlan4_flow_input_node;

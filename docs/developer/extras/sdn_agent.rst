@@ -419,3 +419,105 @@ ip6-nd 的原路径只在带选项时学习；本次在通过原有校验的 sol
 
 原生诊断命令：vppctl show neighbor-keepalive。
 协议依据见 `RFC 4861 第 7.2.5 节 <https://www.rfc-editor.org/rfc/rfc4861.html#section-7.2.5>`_。
+
+可修改的 VXLAN 外层路由表
+--------------------------
+
+配置链路为 Web 资源候选 → Controller 差异计划 → Agent gRPC →
+VPP composite Driver → 本地适配器 → vxlan_set_encap_vrf Binary API。
+protobuf 在 Vxlan 新增 optional uint32 encap_vrf_id = 7，JSON 为 encapVrfId。
+optional 保留 SET 中显式回到 0 的语义。能力标志为 vxlan-encap-vrf/v1；
+Controller 对 SET 及非零表 CREATE 检查该能力，避免旧节点静默忽略字段。
+
+Controller 保留对象身份，差异编译为单条 VXLAN SET，不用删除/重建。
+合并时保留原有 UDP 端口。原有租户 VRF 与外层 VRF 独立；非零外层表引用
+节点内已管理的 TENANT 路由表。先切换、再删除旧表，避免删除顺序提前
+释放仍被使用的表。
+
+原生 VPP 的处理顺序：
+
+* 用目标表 ID 查同地址族的 FIB index，检查接口、表存在性及新接收键冲突。
+* worker barrier 内迁移含 FIB index 的 IPv4/IPv6 接收键、VTEP 引用和 FIB 引用。
+* 多点接口保留 MAC→VTEP / BUM 表；固定目的接口重新跟踪目的路由并重建 DPO。
+* 保留 sw_if_index、VNI、BD 成员关系；清空 bypass VTEP 缓存后释放 barrier。
+
+原生接口同时覆盖 IPv4 / IPv6、src-only multipoint 和 fixed-dst。
+组播目的或启用 RX flow offload 的隧道暂不支持在线迁移，修改前明确拒绝；
+这不影响原有创建路径。原生示例（对已由 Agent 管理的对象应使用 Agent，
+直接 CLI 改动会被期望配置重新同步）：
+
+.. code-block:: text
+
+   ip table add 100
+   ip6 table add 100
+   set vxlan tunnel vxlan_tunnel0 encap-vrf-id 100
+   show vxlan tunnel
+
+Binary API 为 vxlan_set_encap_vrf(sw_if_index, encap_vrf_id)。
+dump 中 encap_vrf_id 是用户表 ID；CLI fib-idx 是 VPP 内部索引，
+二者不能混用。multipoint 的 CLI 输出省略未配置的 dst。
+
+适配器同步 Linux VXLAN 的 IFLA_VXLAN_LINK，不改变其 bridge master。
+显式 underlay 必须在 Linux 与 VPP 均处于目标路由表；不自动迁移物理接口。
+先验证，写入事务日志，再更新控制镜像和 VPP；失败由 Agent 的完整 Undo 恢复。
+恢复旧版 Undo 中缺省的表时补成 0，保证 Linux 镜像也回滚。
+状态文件版本升为 4，继续读取版本 1/2/3，重载时恢复外层表。
+启动配置仍负责 Underlay/LCP 的存在和可达性；本接口不承诺无损切换。
+
+原生回归入口为配套 Agent 的 lab/vpp_encap_vrf_api.py，
+仅在隔离容器内执行。配套 Agent 的组网验证命令：
+
+.. code-block:: sh
+
+   export SDN_VPP_IMAGE=alpine/sdn-agent:encap-vrf-test
+   export SDN_CONTROLLER_IMAGE=alpine/sdn-controller:encap-vrf-test
+   export SDN_WEB_IMAGE=alpine/sdn-web:encap-vrf-test
+   export SDN_VPP_STACK=1 SDN_VPP_ENCAP_VRF_ONLY=1
+   python3 lab/vpp_irb.py
+   SDN_VPP_UNDERLAY=6 python3 lab/vpp_irb.py
+
+实验独立管理/BGP 网络和数据 Underlay，在测试容器中准备承载表，
+再通过真实 Web Gateway / Controller 提交变更。没有使用宿主机物理网卡。
+
+FRR 下一跳解析也需要承载可达性
+----------------------------------------
+
+当 BGP EVPN 实例仍在 default VRF，而数据 Underlay 已迁移到 OUTER100，
+仅在 VPP 表 100 中存在路由还不够：默认 BGP 实例也必须解析远端 VTEP，
+否则 EVPN 路由可能已接收但无 valid/best 标记，进而撤销租户路由和远端 MAC。
+
+可按部署设计向控制面 VRF 泄漏真实承载路由。例如远端 VTEP
+192.0.2.2 已经可以通过 OUTER100 中的 uplink 直连访问时，在 FRR 配置：
+
+.. code-block:: text
+
+   ip route 192.0.2.2/32 uplink nexthop-vrf OUTER100
+
+IPv6 对应使用 ipv6 route <VTEP>/128 uplink nexthop-vrf OUTER100。
+这是一条经真实 Underlay 出口解析的路由，不能用黑洞或伪造直连路由来让
+EVPN 强行选路。使用其他 IGP/BGP 泄漏方案时同样验证 show ip nht / show ipv6 nht。
+接口移动、该路由泄漏及其启动恢复由承载网络配置负责，
+VXLAN SET 不自动配置它们。当前 Agent 的 STATIC_ROUTE 资源没有 nexthop-vrf 字段；
+可在部署时的 FRR 配置文件中维护此项。
+
+2026-10-28 外层 VRF 验收
+------------------------
+
+Agent / Controller / Gateway 全部 Go 测试、45 项 Python 适配器测试、
+25 项 Docker/Python 测试、Web 18 项测试及类型检查/生产构建通过。
+真实浏览器验证外层 VRF 表单提交显式 0，以及原生查询列。
+
+原生 CLI/API 覆盖 IPv4 / IPv6 的多点与固定目的接口、目标表冲突、
+保留 BD/远端表、释放旧接收键以及删除后释放新键；
+在无 worker 与两个 worker 下均通过。
+
+使用配套集成测试镜像运行两个完整隔离实验，分别采用 IPv4 / IPv6 VTEP，
+内层均为双栈，worker 为 0，sourceOverrides=false。
+真实 Web Gateway / Controller 提交 0→100→200→0，验证双向跨网段通信、
+接口及租户绑定保留、新适配器进程从持久化状态恢复、
+修改失败回滚、删除失败后 Linux 镜像及非零表原生隧道恢复。
+补充修复大 VNI/VRF ID 被科学计数法读回导致的校验失败。
+
+汇总报告：配套 Agent 仓库
+artifacts/vpp/encap-vrf-20261028-143107/verification.json。
+未替换运行环境或覆盖 v1.0；此次为软件路径验收，不代表物理网卡或性能验收。

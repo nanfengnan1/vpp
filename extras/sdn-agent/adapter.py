@@ -162,7 +162,7 @@ class VPP:
         self.client = VPPApiClient(server_address=path, apidir=apidir, read_timeout=5)
         self.client.connect("sdn-agent-evpn")
         # Refuse the unpatched API rather than silently flood withdrawn VTEPs.
-        if not hasattr(self.client.api, "vxlan_mp_remote_add_del_v2"):
+        if not all(hasattr(self.client.api, name) for name in ("vxlan_mp_remote_add_del_v2", "vxlan_set_encap_vrf")):
             raise RuntimeError(
                 "VPP lacks native multipoint VXLAN; build the matching SDN VPP source first"
             )
@@ -207,7 +207,7 @@ class Engine:
         saved = (
             json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
         )
-        if saved and saved.get("version") not in (1, 2, 3):
+        if saved and saved.get("version") not in (1, 2, 3, 4):
             raise RuntimeError("unsupported VPP adapter state version")
         self.model = normalized(saved.get("desired", empty()))
         self.previous = saved.get("previous")
@@ -224,7 +224,7 @@ class Engine:
     def save(self):
         atomic_json(
             self.state_file,
-            {"version": 3, "desired": self.model, "previous": self.previous},
+            {"version": 4, "desired": self.model, "previous": self.previous},
         )
 
     def restore_mirrors(self):
@@ -270,7 +270,9 @@ class Engine:
                             str(obj.get("port", 4789)),
                             "nolearning",
                         ]
-                        if obj.get("underlay"):
+                        if "encapVrfId" in obj:
+                            args += ["dev", self.mirror_underlay(obj, links)]
+                        elif obj.get("underlay"):
                             args += ["dev", obj["underlay"]]
                     self.run(*args)
                 if kind == "bridge":
@@ -331,16 +333,33 @@ class Engine:
                 raise ValueError("unbind managed ports before deleting a BD")
         if code == "VXLAN":
             x = op["vxlan"]
+            if op["action"] == "SET":
+                if x["name"] not in self.model["vxlans"]:
+                    raise ValueError("VXLAN does not exist; create it first")
+                if "encapVrfId" not in x or set(x) - {"name", "encapVrfId", "underlay"}:
+                    raise ValueError("VXLAN SET only changes encapVrfId and underlay")
+                x = {**self.model["vxlans"][x["name"]], **x}
             if op["action"] != "DELETE":
                 ip = ipaddress.ip_address(x["local"])
                 if ip.is_multicast or ip.is_unspecified or ip.is_link_local:
-                    raise ValueError(
-                        "VTEP requires an unicast IPv4/IPv6 address without a scope zone"
-                    )
+                    raise ValueError("VTEP requires a unicast IPv4/IPv6 address")
                 if x.get("learning"):
                     raise ValueError("remote VXLAN learning must be disabled with EVPN")
                 if x.get("underlay") and x["underlay"] not in pairs:
                     raise ValueError("VXLAN underlay must be an LCP-paired interface")
+                if "encapVrfId" in x:
+                    table = x["encapVrfId"]
+                    if type(table) is not int or table < 0 or table >= ALL or table in (253, 254, 255):
+                        raise ValueError("invalid/reserved VXLAN outer VRF table ID")
+                    if not any(r.table.table_id == table and bool(r.table.is_ip6) == (ip.version == 6)
+                               for r in self.api.call("ip_table_dump")):
+                        raise ValueError("VXLAN outer VRF table does not exist")
+                    self.mirror_underlay(x)
+                    if x.get("underlay"):
+                        actual = self.api.call("sw_interface_get_table",
+                            sw_if_index=pairs[x["underlay"]], is_ipv6=ip.version == 6)
+                        if actual.vrf_id != table:
+                            raise ValueError("VPP underlay interface belongs to another outer VRF")
             if op["action"] == "DELETE" and x["name"] in self.model["ports"]:
                 raise ValueError("unbind VXLAN before deleting it")
         if code == "BD_PORT":
@@ -389,6 +408,12 @@ class Engine:
     def set_model(self, target):
         self.previous = copy.deepcopy(self.model)
         self.model = copy.deepcopy(target)
+        # Old Undo/state files omitted the default outer table. Materialize zero
+        # when reverting a later explicit change so the Linux mirror is restored
+        # too, including recovery after an interrupted transaction.
+        for name, obj in self.model["vxlans"].items():
+            if "encapVrfId" in self.previous["vxlans"].get(name, {}):
+                obj.setdefault("encapVrfId", 0)
         self.paused = True
         self.save()  # journal intent before the first VPP mutation
         self.reconcile()
@@ -450,7 +475,60 @@ class Engine:
                 item["macs"].add(mac)
         return result
 
+    def mirror_underlay(self, obj, links=None):
+        """Choose a Linux control socket routing domain, never move an uplink."""
+        if links is None:
+            links = {r["ifname"]: r for r in json.loads(self.run("ip", "-j", "-d", "link", "show"))}
+        table = int(obj.get("encapVrfId", 0))
+        lower = obj.get("underlay")
+        if not lower:
+            if not table:
+                return "lo"
+            matches = [name for name, r in links.items()
+                       if r.get("linkinfo", {}).get("info_kind") == "vrf"
+                       and r["linkinfo"].get("info_data", {}).get("table") == table]
+            if len(matches) != 1:
+                raise ValueError("outer VRF requires a matching Linux VRF control interface")
+            return matches[0]
+        seen, current, actual = set(), lower, 0
+        while current:
+            if current in seen or current not in links:
+                raise ValueError("invalid Linux underlay interface hierarchy")
+            seen.add(current)
+            row = links[current]
+            info = row.get("linkinfo", {})
+            if info.get("info_kind") == "vrf":
+                actual = int(info["info_data"]["table"])
+                break
+            current = row.get("master")
+            if isinstance(current, int):
+                current = next((n for n, r in links.items() if r.get("ifindex") == current), None)
+        if actual != table:
+            raise ValueError("Linux underlay interface belongs to another outer VRF")
+        return lower
+
+    def sync_underlay_mirrors(self, verify=False):
+        explicit = [x for x in self.model["vxlans"].values() if "encapVrfId" in x]
+        if not explicit:
+            return
+        links = {r["ifname"]: r for r in json.loads(self.run("ip", "-j", "-d", "link", "show"))}
+        for obj in explicit:
+            lower = self.mirror_underlay(obj, links)
+            row = links.get(obj["name"])
+            if not row or row.get("linkinfo", {}).get("info_kind") != "vxlan":
+                raise RuntimeError("VXLAN control mirror missing")
+            actual = row["linkinfo"].get("info_data", {}).get("link")
+            if isinstance(actual, int):
+                actual = next((n for n, r in links.items() if r.get("ifindex") == actual), None)
+            # An unbound socket is already in the default routing domain.
+            if actual == lower or (not actual and lower == "lo"):
+                continue
+            if verify:
+                raise RuntimeError("VXLAN control mirror outer VRF differs")
+            self.run("ip", "link", "set", "dev", obj["name"], "type", "vxlan", "dev", lower)
+
     def reconcile(self):
+        self.sync_underlay_mirrors()
         interfaces, bridges, tunnels, pairs = self.api.snapshot()
         desired = self.model
         # Detach only ports currently inside owned BDs. No global flush.
@@ -569,7 +647,7 @@ class Engine:
                         vni=t["vni"],
                         src_port=t["src_port"],
                         dst_port=t["dst_port"],
-                        encap_vrf_id=t["encap_vrf_id"],
+                        encap_vrf_id=t.get("encap_vrf_id", 0),
                         instance=ALL,
                         mcast_sw_if_index=ALL,
                         decap_next_index=ALL,
@@ -596,7 +674,7 @@ class Engine:
                     dst_address=dst,
                     src_port=x.get("port", 4789),
                     dst_port=x.get("port", 4789),
-                    encap_vrf_id=0,
+                    encap_vrf_id=x.get("encapVrfId", 0),
                     mcast_sw_if_index=ALL,
                     decap_next_index=ALL,
                     vni=x["vni"],
@@ -610,6 +688,9 @@ class Engine:
                 if target is not None:
                     self.member(index, target, shg=1)
             else:
+                if tunnels[index].get("encap_vrf_id", 0) != x.get("encapVrfId", 0):
+                    self.api.call("vxlan_set_encap_vrf", sw_if_index=index,
+                                  encap_vrf_id=x.get("encapVrfId", 0))
                 current_bd = next(
                     (
                         i
@@ -682,7 +763,7 @@ class Engine:
                 vni=t["vni"],
                 src_port=t["src_port"],
                 dst_port=t["dst_port"],
-                encap_vrf_id=t["encap_vrf_id"],
+                encap_vrf_id=t.get("encap_vrf_id", 0),
                 instance=ALL,
                 mcast_sw_if_index=ALL,
                 decap_next_index=ALL,
@@ -811,6 +892,7 @@ class Engine:
             b = bridges.get(bd_id(name))
             if not b or b.get("bd_tag") != PREFIX + "bd/" + name:
                 raise RuntimeError(f"VPP bridge {name} missing")
+        self.sync_underlay_mirrors(verify=True)
         vx_indices = {}
         for name, obj in self.model["vxlans"].items():
             matches = [
@@ -830,6 +912,7 @@ class Engine:
                 or row["vni"] != obj["vni"]
                 or row["src_port"] != obj.get("port", 4789)
                 or row["dst_port"] != obj.get("port", 4789)
+                or row.get("encap_vrf_id", 0) != obj.get("encapVrfId", 0)
             ):
                 raise RuntimeError(f"native multipoint interface {name} differs")
         if op["code"] == "VXLAN" and op["action"] == "DELETE":
@@ -974,6 +1057,7 @@ class Engine:
                             "bridge": self.model["ports"].get(name, {}).get("bridge"),
                             "local": str(t["src_address"]),
                             "port": t["dst_port"],
+                            "encapVrfId": t.get("encap_vrf_id", 0),
                             "family": (
                                 "IPV6"
                                 if ipaddress.ip_address(str(t["src_address"])).version

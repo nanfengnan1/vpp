@@ -234,3 +234,68 @@ neighbor_keepalive_scope_add_del、neighbor_keepalive_scope_dump 和 neighbor_ke
 SDN_VPP_KEEPALIVE=1 时执行；可结合 SDN_VPP_STACK=1 验证 Web/Gateway/Controller
 候选提交。SDN_VPP_UNDERLAY=6 测试 IPv6 VTEP，内层一直是双栈。
 实验输出决定验收结论，不代表物理 NIC 或规模性能测试通过。
+
+VXLAN 外层 VRF：创建与在线修改
+--------------------------------
+
+VPP 节点支持为 VXLAN 设置外层路由表，并在创建后修改。
+外层 VRF 用于到远端 VTEP 的封装路由及接收隧道匹配；内层租户 VRF 仍由
+BD/BVI 与 TENANT 的关系决定。修改外层表不改变 VNI、原生接口编号或 BD 绑定。
+
+使用前先准备同地址族的 VPP 路由表、Linux VRF 控制映射以及到远端 VTEP 的
+底层路由。通过 Controller 管理时，非零外层表必须先以 TENANT 资源创建；
+这个承载 VRF 可以没有业务 BD 和 L3VNI。表 ID 0 表示 VPP 默认表，不能把
+Linux main 的数字 254 填进此字段。253、254、255 和 4294967295 被拒绝。
+
+Web 中选择支持 ``vxlan-encap-vrf/v1`` 的节点，进入“隧道 / VXLAN”：
+
+1. 创建 VXLAN 时可以填写“外层 VRF 表 ID”。
+2. 对已有隧道选择“修改 VXLAN 外层 VRF”，填写名称及目标表 ID。
+3. 加入候选、预览计划后提交；回到默认表时明确填写 0。
+4. 运行查询的“外层 VRF 表 ID”显示 VPP 实际值。
+
+Agent / Controller 资源操作示例：
+
+.. code-block:: json
+
+   {
+     "code": "VXLAN",
+     "action": "SET",
+     "vxlan": {"name": "vx50000", "encapVrfId": 100}
+   }
+
+CREATE 使用相同的可选字段，同时提供 local、vni 等创建参数。
+SET 只修改 encapVrfId 和可选的 underlay；不接受 local、vni、port 或 learning
+的身份修改。已有 underlay 留空表示保留，不表示清除。显式指定的 underlay
+必须是 LCP 接口，而且 Linux 与 VPP 两侧均已属于目标外层表。
+省略 underlay 时，非零表使用对应 Linux VRF 作为控制镜像的底层设备；
+VXLAN 的 bridge master 仍然是原有租户 BD。
+
+此操作不会替用户迁移物理网卡、调整 BGP 管理连接或创建远端 VTEP 路由。
+先完成承载网络准备，再修改隧道；切换可能短暂中断通信。要删除旧承载 VRF，
+先单独提交所有隧道的切换，再删除 VRF；仍被引用的表不能删除。
+
+需要同时更新 VPP 插件/API/适配器、Agent、Controller 和 Web。
+旧节点或 Linux 数据面不显示修改入口；Linux 后端拒绝非零 encapVrfId。
+设备配置由适配器持久化，重新加载时仍需先恢复启动配置管理的 Underlay/LCP。
+
+FRR 下一跳解析也需要承载可达性
+----------------------------------------
+
+当 BGP EVPN 实例仍在 default VRF，而数据 Underlay 已迁移到 OUTER100，
+仅在 VPP 表 100 中存在路由还不够：默认 BGP 实例也必须解析远端 VTEP，
+否则 EVPN 路由可能已接收但无 valid/best 标记，进而撤销租户路由和远端 MAC。
+
+可按部署设计向控制面 VRF 泄漏真实承载路由。例如远端 VTEP
+192.0.2.2 已经可以通过 OUTER100 中的 uplink 直连访问时，在 FRR 配置：
+
+.. code-block:: text
+
+   ip route 192.0.2.2/32 uplink nexthop-vrf OUTER100
+
+IPv6 对应使用 ipv6 route <VTEP>/128 uplink nexthop-vrf OUTER100。
+这是一条经真实 Underlay 出口解析的路由，不能用黑洞或伪造直连路由来让
+EVPN 强行选路。使用其他 IGP/BGP 泄漏方案时同样验证 show ip nht / show ipv6 nht。
+接口移动、该路由泄漏及其启动恢复由承载网络配置负责，
+VXLAN SET 不自动配置它们。当前 Agent 的 STATIC_ROUTE 资源没有 nexthop-vrf 字段；
+可在部署时的 FRR 配置文件中维护此项。

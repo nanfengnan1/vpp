@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 
-option version = "2.3.0";
+option version = "2.4.0";
 
 import "vnet/interface_types.api";
 import "vnet/ip/ip_types.api";
@@ -267,4 +267,17 @@ autoreply define vxlan_offload_rx
   vl_api_interface_index_t hw_if_index;
   vl_api_interface_index_t sw_if_index;
   bool enable [default=true];
+};
+
+
+/** Change an existing unicast or multipoint tunnel's underlay table.
+    Retains sw_if_index, VNI, BD membership and remote mappings.
+    Rejects multicast/RX-offloaded tunnels and conflicting receive keys.
+    encap_vrf_id is a table ID, not an internal FIB index. */
+autoreply define vxlan_set_encap_vrf
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u32 encap_vrf_id;
 };

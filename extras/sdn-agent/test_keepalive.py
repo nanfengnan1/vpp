@@ -109,7 +109,7 @@ class KeepaliveTests(unittest.TestCase):
             engine.save()
             restored = IRBEngine(api, path)
             self.assertTrue(keepalive.enabled(restored.model))
-            self.assertEqual(json.loads(path.read_text())["version"], 3)
+            self.assertEqual(json.loads(path.read_text())["version"], 4)
             restored.verify(
                 restored.rollback_expectation({"code": "NEIGHBOR_KEEPALIVE"})
             )

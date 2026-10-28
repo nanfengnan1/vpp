@@ -26,6 +26,15 @@ static u16 msg_id_base;
 #include <vlibapi/api_helper_macros.h>
 
 static void
+vl_api_vxlan_set_encap_vrf_t_handler (vl_api_vxlan_set_encap_vrf_t *mp)
+{
+  vl_api_vxlan_set_encap_vrf_reply_t *rmp;
+  int rv = vnet_vxlan_set_encap_vrf (ntohl (mp->sw_if_index),
+                                  ntohl (mp->encap_vrf_id));
+  REPLY_MACRO (VL_API_VXLAN_SET_ENCAP_VRF_REPLY);
+}
+
+static void
 vl_api_vxlan_offload_rx_t_handler (vl_api_vxlan_offload_rx_t * mp)
 {
   vl_api_vxlan_offload_rx_reply_t *rmp;

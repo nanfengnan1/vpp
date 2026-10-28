@@ -68,13 +68,15 @@ format_vxlan_tunnel (u8 * s, va_list * args)
 {
   vxlan_tunnel_t *t = va_arg (*args, vxlan_tunnel_t *);
 
+  s = format (s, "[%d] instance %d src %U ", t->dev_instance,
+              t->user_instance, format_ip46_address, &t->src, IP46_TYPE_ANY);
+  /* Multipoint tunnels select the remote VTEP per packet. */
+  if (!t->multipoint)
+    s = format (s, "dst %U ", format_ip46_address, &t->dst, IP46_TYPE_ANY);
   s = format (s,
-	      "[%d] instance %d src %U dst %U src_port %d dst_port %d vni %d "
-	      "fib-idx %d sw-if-idx %d ",
-	      t->dev_instance, t->user_instance, format_ip46_address, &t->src,
-	      IP46_TYPE_ANY, format_ip46_address, &t->dst, IP46_TYPE_ANY,
-	      t->src_port, t->dst_port, t->vni, t->encap_fib_index,
-	      t->sw_if_index);
+              "src_port %d dst_port %d vni %d fib-idx %d sw-if-idx %d ",
+              t->src_port, t->dst_port, t->vni, t->encap_fib_index,
+              t->sw_if_index);
 
   s = format (s, "encap-dpo-idx %d ", t->next_dpo.dpoi_index);
   if (t->multipoint)
@@ -716,6 +718,126 @@ get_decap_next_for_node (u32 node_index, u32 ipv4_set)
 
   return vlib_node_add_next (vm, input_node, node_index);
 }
+
+
+/* Keep interface identity and remote state while moving both directions to
+ * another underlay FIB. Multicast and RX-offloaded tunnels need separate MFIB
+ * / hardware migration and are deliberately rejected before any mutation. */
+int
+vnet_vxlan_set_encap_vrf (u32 sw_if_index, u32 table_id)
+{
+  vxlan_main_t *vxm = &vxlan_main;
+  u32 ti = vnet_vxlan_get_tunnel_index (sw_if_index);
+  if (ti == ~0)
+    return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+  vxlan_tunnel_t *t = pool_elt_at_index (vxm->tunnels, ti);
+  fib_protocol_t fp = fib_ip_proto (!ip46_address_is_ip4 (&t->src));
+  u32 new_fib = fib_table_find (fp, table_id);
+  u32 old_fib = t->encap_fib_index;
+  if (new_fib == ~0)
+    return VNET_API_ERROR_NO_SUCH_FIB;
+  if (new_fib == old_fib)
+    return 0;
+  if (ip46_address_is_multicast (&t->dst) || t->flow_index != ~0)
+    return VNET_API_ERROR_UNIMPLEMENTED;
+
+  clib_bihash_kv_16_8_t old4 = {}, new4 = {}, found4;
+  clib_bihash_kv_24_8_t old6 = {}, new6 = {}, found6;
+  clib_bihash_24_8_t *h6 = t->multipoint ?
+    &vxm->vxlan6_mp_tunnel_by_key : &vxm->vxlan6_tunnel_by_key;
+  u8 is_ip4 = ip46_address_is_ip4 (&t->src);
+  if (is_ip4)
+    {
+      old4.key[0] = t->dst.ip4.as_u32 | ((u64) t->src.ip4.as_u32 << 32);
+      old4.key[1] = ((u64) clib_host_to_net_u16 (t->src_port) << 48) |
+        ((u64) old_fib << 32) | clib_host_to_net_u32 (t->vni << 8);
+      if (clib_bihash_search_16_8 (&vxm->vxlan4_tunnel_by_key, &old4, &found4))
+        return VNET_API_ERROR_NO_SUCH_ENTRY;
+      old4.value = found4.value;
+      new4 = old4;
+      new4.key[1] = ((u64) clib_host_to_net_u16 (t->src_port) << 48) |
+        ((u64) new_fib << 32) | clib_host_to_net_u32 (t->vni << 8);
+      if (!clib_bihash_search_16_8 (&vxm->vxlan4_tunnel_by_key, &new4, &found4))
+        return VNET_API_ERROR_TUNNEL_EXIST;
+    }
+  else
+    {
+      ip6_address_t *address = t->multipoint ? &t->src.ip6 : &t->dst.ip6;
+      old6.key[0] = address->as_u64[0];
+      old6.key[1] = address->as_u64[1];
+      old6.key[2] = ((u64) clib_host_to_net_u16 (t->src_port) << 48) |
+        ((u64) old_fib << 32) | clib_host_to_net_u32 (t->vni << 8);
+      if (clib_bihash_search_24_8 (h6, &old6, &found6))
+        return VNET_API_ERROR_NO_SUCH_ENTRY;
+      old6.value = found6.value;
+      new6 = old6;
+      new6.key[2] = ((u64) clib_host_to_net_u16 (t->src_port) << 48) |
+        ((u64) new_fib << 32) | clib_host_to_net_u32 (t->vni << 8);
+      if (!clib_bihash_search_24_8 (h6, &new6, &found6))
+        return VNET_API_ERROR_TUNNEL_EXIST;
+    }
+
+  vlib_main_t *vm = vlib_get_main ();
+  vlib_worker_thread_barrier_sync (vm);
+  int rv = is_ip4 ?
+    clib_bihash_add_del_16_8 (&vxm->vxlan4_tunnel_by_key, &new4, 1) :
+    clib_bihash_add_del_24_8 (h6, &new6, 1);
+  if (rv)
+    {
+      vlib_worker_thread_barrier_release (vm);
+      return VNET_API_ERROR_INVALID_REGISTRATION;
+    }
+  if (is_ip4)
+    clib_bihash_add_del_16_8 (&vxm->vxlan4_tunnel_by_key, &old4, 0);
+  else
+    clib_bihash_add_del_24_8 (h6, &old6, 0);
+
+  vtep_addr_ref (&vxm->vtep_table, new_fib, &t->src);
+  vtep_addr_unref (&vxm->vtep_table, old_fib, &t->src);
+  if (t->multipoint)
+    {
+      fib_table_lock (new_fib, fp, FIB_SOURCE_RR);
+      t->encap_fib_index = new_fib;
+      fib_table_unlock (old_fib, fp, FIB_SOURCE_RR);
+    }
+  else
+    {
+      fib_prefix_t prefix;
+      fib_prefix_from_ip46_addr (fp, &t->dst, &prefix);
+      /* Pin the new table while the old tracked route is released. */
+      fib_table_lock (new_fib, fp, FIB_SOURCE_RR);
+      fib_entry_untrack (t->fib_entry_index, t->sibling_index);
+      t->encap_fib_index = new_fib;
+      t->fib_entry_index = fib_entry_track (
+        new_fib, &prefix, FIB_NODE_TYPE_VXLAN_TUNNEL, ti, &t->sibling_index);
+      vxlan_tunnel_restack_dpo (t);
+      fib_table_unlock (new_fib, fp, FIB_SOURCE_RR);
+    }
+  clib_memset (&vxm->vtep4_u512, 0, sizeof (vxm->vtep4_u512));
+  vlib_worker_thread_barrier_release (vm);
+  return 0;
+}
+
+static clib_error_t *
+vxlan_set_encap_vrf_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                               vlib_cli_command_t *cmd)
+{
+  u32 sw_if_index = ~0, table_id = ~0;
+  if (!unformat (input, "%U encap-vrf-id %u", unformat_vnet_sw_interface,
+                 vnet_get_main (), &sw_if_index, &table_id) ||
+      unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    return clib_error_return (0, "expected <interface> encap-vrf-id <table-id>");
+  int rv = vnet_vxlan_set_encap_vrf (sw_if_index, table_id);
+  if (rv)
+    return clib_error_return (0, "VXLAN underlay VRF change failed: %d", rv);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (vxlan_set_encap_vrf_command, static) = {
+  .path = "set vxlan tunnel",
+  .short_help = "set vxlan tunnel <interface> encap-vrf-id <table-id>",
+  .function = vxlan_set_encap_vrf_command_fn,
+};
 
 static uword
 unformat_decap_next (unformat_input_t * input, va_list * args)

@@ -151,6 +151,8 @@ class IRBEngine(Engine):
                         x.get("tenant") == name for x in self.model["bindings"].values()
                     )
                     or name in self.model["l3vnis"]
+                    or any(int(x.get("encapVrfId", 0)) == int(self.model["tenants"].get(name, {}).get("tableId", -1))
+                           for x in self.model["vxlans"].values())
                 ):
                     raise ValueError(
                         "unbind tenant bridges and L3VNI before deleting the tenant"
