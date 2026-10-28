@@ -54,6 +54,21 @@ User guide: [SDN Agent with VPP/FRR](../../docs/usecases/sdn_agent.rst).
 Developer guide: [architecture, LCP nodes, and packet paths](../../docs/developer/extras/sdn_agent.rst).
 The companion build accepts `VPP_REF` / `FRR_REF` (tag, branch or commit) from
 `nanfengnan1/vpp` / `nanfengnan1/frr`, or local `VPP_SOURCE` / `FRR_SOURCE`.
-Use `BUILD_BASES=1` initially. The selected VPP ref must include these changes;
-the full GitHub-source image build remains pending until they are pushed.
+The defaults are `VPP_REF=sdn/v26.06` and `FRR_REF=frr-10.7.0`.
+Use `BUILD_BASES=1` initially. Set `SOURCE_CACHE_BUST` to a new value when
+rebuilding a moving branch, or pin a full commit for reproducible releases.
+Unset `VPP_SOURCE` / `FRR_SOURCE` to use GitHub instead of local checkouts.
+The selected VPP ref must include these changes; upstream `v26.06` does not.
 Selectable refs do not imply compatibility with arbitrary upstream versions.
+
+## Native neighbor keepalive
+
+Enable neighbor_keepalive_plugin.so in startup.conf, then commit the VPP-only
+NEIGHBOR_KEEPALIVE SET operation with an explicit enabled boolean (default false).
+keepalive.py configures local BVI/access scopes; the native plugin sends unicast
+ARP/NS and uses native neighbor learning timestamps for confirmation. It continues
+while the Python adapter is paused. Three unanswered probes remove only that IP.
+Remote/static neighbors and pure MAC entries are excluded. Status is exposed by
+NEIGHBOR_KEEPALIVE_STATUS. MAC ageing must be 0 or >=120 seconds.
+State version 3 persists policy and reads old versions 1/2 with keepalive disabled.
+See the VPP SDN Agent developer documentation and sdn-agent/lab/vpp_keepalive.py.

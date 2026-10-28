@@ -326,9 +326,17 @@ group 与入口复制的取舍
 
 Agent 构建的 VPP 基础镜像同时包含 native libraries、API JSON、vpp_papi、adapter.py、
 irb.py。集成镜像从同一 VPP 镜像复制它们，禁止另外叠加不同 checkout 的 Python 文件。
-FRR 从 nanfengnan1/frr 的指定 ref 构建；source.json 记录实际 commit 和工作区修改。
+VPP 默认从 nanfengnan1/vpp 的 sdn/v26.06 分支构建，FRR 默认从 nanfengnan1/frr
+的 frr-10.7.0 tag 构建；VPP_REF / FRR_REF 可覆盖默认值。
+source.json 记录实际 commit、请求 ref 和工作区修改；发布时应固定 commit。
 Git ref 可选择不代表任意版本兼容，源码预检查会拒绝缺少本 fork API 的上游版本。
-远端完整源码镜像构建仍待验证；本地代码提交和功能验收不等同指定远端 ref 构建或发布成功。
+2026-10-27 已验证 GitHub 源码构建：VPP 提交 194ee9f7db669e9776dd7e0fd9845ef2d9dd8031，
+FRR 提交 87fe21fda92ce9e2ba3eaf2b0a327bf71ee183ef，均为未修改的 Git checkout，
+另由 Dockerfile 应用已记录的 Alpine 兼容补丁。构建和软件验收记录见配套 Agent
+的 docs/developer/vpp.rst；移动分支的新提交与其他版本组合仍需重新验收。
+该 GitHub 构建镜像已通过 IPv4/IPv6 underlay 的二层 EVPN 与对称 IRB 四组软件实验，
+覆盖内层双栈、Type-2/3/5、隔离、回滚和撤销；未使用本地脚本覆盖镜像适配器，
+本次没有重复物理 VF 或硬件卸载验收。
 
 维护变更时同步三个层面：C API/插件、extras/sdn-agent、配套 Agent capabilities/文档。
 修改 API 后必须重建 native 与 PAPI，不能只重启 Python。
@@ -357,3 +365,57 @@ Git ref 可选择不代表任意版本兼容，源码预检查会拒绝缺少本
 本机已测单 NIC 的三个 HiNIC3 VF、VLAN Spine、PC TAP、双栈 IRB、接收侧抓包和
 Web 查询；硬件 VXLAN TSO/RX LRO、RSS 多队列、外部物理链路、HA 和吞吐未验收。
 HiNIC3 还修复了 PMD 描述缺失导致的 VLAN 子接口空指针崩溃；这不扩大为所有 PMD 认证。
+
+本地动态邻居保活
+----------------
+
+原生进程、收发路径、状态机、重试时间线与函数入口详见 :doc:`neighbor_keepalive`。
+
+src/plugins/neighbor_keepalive 提供默认关闭的原生插件。
+Agent 通过 extras/sdn-agent/keepalive.py 配置节点开关与 BVI/本地接入口范围；
+neighbor-keepalive-process 在主线程独立维护已学习到的动态 IP 邻居。
+已有 ARP/ND 校验与学习路径提供确认时间，应答仍正常经过 L2 学习。
+不拦截后丢包，不通过探测发送、Linux 永久项或周期 BGP 通告更新存活状态。
+
+键为 BVI + 地址族 + IP，记录 MAC 与接入端口。向已知主机发单播 ARP Request
+或 IPv6 NS；三次探测间隔 5 秒，无应答删除对应动态邻居。
+同 MAC 的多个 IPv4/IPv6 地址独立维护，远端静态邻居、VXLAN 端口、未受管接口
+不加入范围。失败项最多保留 300 秒供查询，新有效学习可重新激活。
+当前通过周期查询同步结果，没有新增异步事件订阅。
+
+适配器撤销本地 Linux 镜像邻居时，先把该 IP 的状态设置为 NUD_FAILED，再删除。
+直接删除 NUD_PERMANENT 项会进入 FRR Zebra 的 RFC 5549 特殊路径，可能留下 Type-2。
+失败状态通知让 Zebra 撤销该 IP；共享 MAC 的健康 IP 仍保留。
+内核项已被提前清空时仍使用发布记录发送失败通知，并避让新的 MAC/远端所有者。
+bridge MAC 只在实际变化时更新；重复设置同一 MAC 也会触发 Linux 永久邻居清理。
+
+VPP FDB 为分钟粒度，探测间隔 (age-60)/2 并提前最多 10% 抖动。
+启用要求 age=0 或 >=120 秒；0 时采用约 135–150 秒。
+最多跟踪 4096 绑定，每秒最多 512 探测，发送及容量错误通过 API 公开。
+状态模型 version 3 持久化开关，兼容旧 version 1/2；动态存活结果不作为冷启动依据。
+
+在 plugins 配置中启用 neighbor_keepalive_plugin.so，然后通过 Agent
+NEIGHBOR_KEEPALIVE SET 设置 enabled=true。NEIGHBOR_KEEPALIVE_STATUS 提供查询。
+原生 API 为 neighbor_keepalive_set、neighbor_keepalive_status、
+neighbor_keepalive_scope_add_del、neighbor_keepalive_scope_dump 和 neighbor_keepalive_dump。
+
+集成实验位于 sdn-agent/lab/vpp_keepalive.py，由 vpp_irb.py 在
+SDN_VPP_KEEPALIVE=1 时执行；可结合 SDN_VPP_STACK=1 验证 Web/Gateway/Controller
+候选提交。SDN_VPP_UNDERLAY=6 测试 IPv6 VTEP，内层一直是双栈。
+实验输出决定验收结论，不代表物理 NIC 或规模性能测试通过。
+
+
+IPv6 单播 NA 确认
+-----------------
+
+Linux 对单播 NS 的应答可以不携带 Target Link-Layer Address 选项。
+ip6-nd 的原路径只在带选项时学习；本次在通过原有校验的 solicited NA
+上补充确认路径，通过主线程 RPC 查找相同接口/IP 的已有动态邻居，
+仅在以太网源 MAC 匹配时刷新时间。不会从无选项 NA 创建邻居、变更 MAC
+或刷新静态/远端项；非 solicited 或错误源 MAC 的报文不能续期。
+涉及 src/vnet/ip6-nd/ip6_nd.c 与 ip-neighbor 的 confirm/confirm_dp 接口。
+构建预检会检查这项适配，不能只复制 Python 文件替代原生更新。
+集成测试从 PC 接收端抓取无 TLLA 的真实 NA，并注入错误源 MAC 的 NA 验证拒绝续期。
+
+原生诊断命令：vppctl show neighbor-keepalive。
+协议依据见 `RFC 4861 第 7.2.5 节 <https://www.rfc-editor.org/rfc/rfc4861.html#section-7.2.5>`_。

@@ -151,6 +151,25 @@ icmp6_neighbor_solicitation_or_advertisement (vlib_main_t * vm,
 	      memcpy (&learn.mac, o0->ethernet_address, sizeof (learn.mac));
 	      ip_neighbor_learn_dp (&learn);
 	    }
+          /* RFC 4861 7.2.5: a solicited unicast NA may omit TLLA. Linux
+           * commonly does this when answering a unicast reachability probe.
+           * Confirm only an existing dynamic binding with the same Ethernet
+           * source; never create a neighbor or change its MAC from this path.
+           * ICMP validation (including checksum and hop limit) precedes here. */
+          else if (!is_solicitation && error0 == ICMP6_ERROR_NONE &&
+                   options_len0 == 0 && !ip6_sadd_unspecified &&
+                   (clib_net_to_host_u32 (h0->advertisement_flags) &
+                    ICMP6_NEIGHBOR_ADVERTISEMENT_FLAG_SOLICITED) &&
+                   (p0->flags & VNET_BUFFER_F_L2_HDR_OFFSET_VALID))
+            {
+              ip_neighbor_learn_t confirmation = {
+                .sw_if_index = sw_if_index0,
+                .ip = { .version = AF_IP6, .ip.ip6 = h0->target_address },
+              };
+              ethernet_header_t *eth = ethernet_buffer_get_header (p0);
+              mac_address_from_bytes (&confirmation.mac, eth->src_address);
+              ip_neighbor_confirm_dp (&confirmation);
+            }
 	  /* Check if this NA conflicts with an ongoing DAD */
 	  if (!is_solicitation)
 	    {

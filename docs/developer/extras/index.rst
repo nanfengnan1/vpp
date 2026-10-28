@@ -15,3 +15,4 @@ VPP extra tools
     hs-test
     kube-test
     sdn_agent
+    neighbor_keepalive

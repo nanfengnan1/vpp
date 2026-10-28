@@ -793,6 +793,21 @@ ip_neighbor_learn (const ip_neighbor_learn_t * l)
 		   IP_NEIGHBOR_FLAG_DYNAMIC, NULL);
 }
 
+void
+ip_neighbor_confirm (const ip_neighbor_learn_t *l)
+{
+  ASSERT (0 == vlib_get_thread_index ());
+  const ip_neighbor_key_t key = {
+    .ipnk_ip = l->ip,
+    .ipnk_sw_if_index = l->sw_if_index,
+  };
+  ip_neighbor_t *ipn = ip_neighbor_db_find (&key);
+  if (ipn && (ipn->ipn_flags & IP_NEIGHBOR_FLAG_DYNAMIC) &&
+      !(ipn->ipn_flags & IP_NEIGHBOR_FLAG_STATIC) &&
+      !mac_address_cmp (&ipn->ipn_mac, &l->mac))
+    ip_neighbor_refresh (ipn);
+}
+
 static clib_error_t *
 ip_neighbor_cmd (vlib_main_t * vm,
 		 unformat_input_t * input, vlib_cli_command_t * cmd)

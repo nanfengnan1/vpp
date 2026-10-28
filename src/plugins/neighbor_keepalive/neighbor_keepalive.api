@@ -1,0 +1,63 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+option version = "1.0.0";
+import "vnet/interface_types.api";
+import "vnet/ip/ip_types.api";
+import "vnet/ethernet/ethernet_types.api";
+
+/** Node policy. Disabled by default. Disabling does not flush neighbors. */
+autoreply define neighbor_keepalive_set {
+  u32 client_index;
+  u32 context;
+  bool enabled;
+};
+define neighbor_keepalive_status {
+  u32 client_index;
+  u32 context;
+};
+define neighbor_keepalive_status_reply {
+  u32 context;
+  i32 retval;
+  bool enabled;
+  u32 targets;
+  u64 probes;
+  u64 confirmed;
+  u64 failed;
+  u64 send_errors;
+  u64 capacity_errors;
+};
+/** Explicitly allow a local access port belonging to this BVI's BD.
+    Never register VXLAN ports or Linux control-plane mirror interfaces. */
+autoreply define neighbor_keepalive_scope_add_del {
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_interface_index_t bvi;
+  vl_api_interface_index_t port;
+};
+define neighbor_keepalive_scope_dump {
+  u32 client_index;
+  u32 context;
+};
+define neighbor_keepalive_scope_details {
+  u32 context;
+  vl_api_interface_index_t bvi;
+  vl_api_interface_index_t port;
+};
+define neighbor_keepalive_dump {
+  u32 client_index;
+  u32 context;
+};
+/** state: 0 reachable, 1 probing, 2 failed, 3 send error.
+    Age is seconds since native ARP/ND learning, never since probe TX. */
+define neighbor_keepalive_details {
+  u32 context;
+  vl_api_interface_index_t bvi;
+  vl_api_interface_index_t port;
+  vl_api_address_t address;
+  vl_api_mac_address_t mac;
+  u8 state;
+  u8 attempts;
+  u32 age;
+  u32 next_probe;
+  u32 interval;
+};

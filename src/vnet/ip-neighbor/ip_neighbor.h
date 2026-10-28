@@ -41,6 +41,8 @@ extern const mac_address_t *ip_neighbor_get_mac (const ip_neighbor_t * ipn);
 extern const u32 ip_neighbor_get_sw_if_index (const ip_neighbor_t * ipn);
 
 extern void ip_neighbor_learn (const ip_neighbor_learn_t * l);
+/* Confirm an existing dynamic binding without creating/changing its MAC. */
+extern void ip_neighbor_confirm (const ip_neighbor_learn_t *l);
 
 extern void ip_neighbor_update (vnet_main_t * vnm, adj_index_t ai);
 

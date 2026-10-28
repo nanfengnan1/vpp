@@ -5,7 +5,8 @@ SDN Agent：VPP + FRR EVPN 使用指南
 
 本 fork 包含 SDN Agent 的原生多点 VXLAN 和本地适配器。FRR 负责 BGP/EVPN，
 VPP 负责租户二层和三层转发。已验收基线是本地 VPP 26.06 与 FRR 10.7.0；
-适配代码推送后的 GitHub 完整镜像构建尚待验证，不应把本文当作生产性能认证。
+GitHub 分支 sdn/v26.06 的完整镜像构建已验证；具体源码提交与软件验收范围
+见配套 Agent 的 docs/developer/vpp.rst，不应把本文当作生产性能认证。
 
 .. contents:: 本页导航
    :local:
@@ -82,16 +83,21 @@ Router MAC，对称 IRB 的基础 BD/BVI/FIB 能力并非本次才引入。
 构建时选择版本
 --------------
 
-在 Linux Docker 宿主机、sdn-agent 仓库内执行。VPP_REF 必须包含本 fork 的适配代码，
-FRR_REF 默认 frr-10.7.0；两者支持 tag、分支或 commit，发布时优先使用完整 commit。
+在 Linux Docker 宿主机、sdn-agent 仓库内执行。VPP_REF 默认 sdn/v26.06，
+FRR_REF 默认 frr-10.7.0，分别来自 nanfengnan1/vpp 和 nanfengnan1/frr。
+两者支持 tag、分支或 commit，发布时优先使用完整 commit。
 选择别的版本只代表选择源码，不保证其 API、依赖或 Alpine 编译兼容。
 
 .. code-block:: bash
 
    cd ~/program/github/sdn-agent
-   # 推送适配代码后，替换成真实 ref。当前不宣称该远端流程已完整编译通过。
-   VPP_REF='替换为包含适配代码的tag或commit' \
-   FRR_REF=frr-10.7.0 BUILD_BASES=1 sh docker/build-vpp.sh
+   # 使用 GitHub 默认分支和 FRR tag；清除本地源码覆盖。
+   unset VPP_SOURCE FRR_SOURCE
+   BUILD_BASES=1 sh docker/build-vpp.sh
+
+   # 分支有新提交时刷新源码缓存，也可把 VPP_REF 固定为完整 commit。
+   VPP_REF=sdn/v26.06 SOURCE_CACHE_BUST="$(date +%s)" \
+   BUILD_BASES=1 sh docker/build-vpp.sh
 
    # 尚未提交的本地代码可以直接构建，不会自动 checkout 本地仓库。
    VPP_SOURCE=/home/alexan/program/subversion/vpp \
@@ -101,6 +107,8 @@ FRR_REF 默认 frr-10.7.0；两者支持 tag、分支或 commit，发布时优�
 默认基础镜像为 alpine/vpp:sdn-base、alpine/frr:sdn-base，集成为
 alpine/sdn-agent:vpp-dev；可分别通过 VPP_IMAGE、FRR_IMAGE、AGENT_IMAGE 改名。
 这些名字不是源码版本选择器。VPP_REPOSITORY / FRR_REPOSITORY 可替换默认仓库。
+上游 v26.06 不含本 fork 的多点 API，不能直接替代 sdn/v26.06。
+显式设置 VPP_SOURCE / FRR_SOURCE 时优先使用对应本地源码，不会拉取该组件的 Git ref。
 BUILD_BASES=0 复用新流程生成的基础镜像，旧镜像缺少内置适配器时需要先重建。
 本地源码路径须为含 .git 目录的完整 clone；脚本单独传递 Git 上下文，
 避免 FRR 的 .dockerignore 排除版本历史。linked worktree 暂不支持。
@@ -196,3 +204,33 @@ IPv4/IPv6 VTEP 分别通过 30/31 项检查，Spine 断链会中断业务，浏�
 
 underlay 和 LCP pair 由启动配置重建；当前未实现全量冷启动 Running 重放。
 租户协议 punt、多归属、HA 和在线切换数据面也未实现。完整恢复边界以 Agent 文档为准。
+
+本地动态邻居保活
+----------------
+
+src/plugins/neighbor_keepalive 提供默认关闭的原生插件。
+Agent 通过 extras/sdn-agent/keepalive.py 配置节点开关与 BVI/本地接入口范围；
+neighbor-keepalive-process 在主线程独立维护已学习到的动态 IP 邻居。
+已有 ARP/ND 校验与学习路径提供确认时间，应答仍正常经过 L2 学习。
+不拦截后丢包，不通过探测发送、Linux 永久项或周期 BGP 通告更新存活状态。
+
+键为 BVI + 地址族 + IP，记录 MAC 与接入端口。向已知主机发单播 ARP Request
+或 IPv6 NS；三次探测间隔 5 秒，无应答删除对应动态邻居。
+同 MAC 的多个 IPv4/IPv6 地址独立维护，远端静态邻居、VXLAN 端口、未受管接口
+不加入范围。失败项最多保留 300 秒供查询，新有效学习可重新激活。
+当前通过周期查询同步结果，没有新增异步事件订阅。
+
+VPP FDB 为分钟粒度，探测间隔 (age-60)/2 并提前最多 10% 抖动。
+启用要求 age=0 或 >=120 秒；0 时采用约 135–150 秒。
+最多跟踪 4096 绑定，每秒最多 512 探测，发送及容量错误通过 API 公开。
+状态模型 version 3 持久化开关，兼容旧 version 1/2；动态存活结果不作为冷启动依据。
+
+在 plugins 配置中启用 neighbor_keepalive_plugin.so，然后通过 Agent
+NEIGHBOR_KEEPALIVE SET 设置 enabled=true。NEIGHBOR_KEEPALIVE_STATUS 提供查询。
+原生 API 为 neighbor_keepalive_set、neighbor_keepalive_status、
+neighbor_keepalive_scope_add_del、neighbor_keepalive_scope_dump 和 neighbor_keepalive_dump。
+
+集成实验位于 sdn-agent/lab/vpp_keepalive.py，由 vpp_irb.py 在
+SDN_VPP_KEEPALIVE=1 时执行；可结合 SDN_VPP_STACK=1 验证 Web/Gateway/Controller
+候选提交。SDN_VPP_UNDERLAY=6 测试 IPv6 VTEP，内层一直是双栈。
+实验输出决定验收结论，不代表物理 NIC 或规模性能测试通过。

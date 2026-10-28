@@ -18,3 +18,9 @@ ip_neighbor_learn_dp (const ip_neighbor_learn_t * l)
 {
   vlib_rpc_call_main_thread (ip_neighbor_learn, (u8 *) l, sizeof (*l));
 }
+
+void
+ip_neighbor_confirm_dp (const ip_neighbor_learn_t *l)
+{
+  vlib_rpc_call_main_thread (ip_neighbor_confirm, (u8 *) l, sizeof (*l));
+}

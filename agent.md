@@ -4,7 +4,7 @@
 
 文档已补充原版 VPP 26.06（`c3200b88d`）与本 fork 多点实现（首次提交 `2814bd686`）的差异：见[开发文档对比与架构](docs/developer/extras/sdn_agent.rst)和[用户模式选择](docs/usecases/sdn_agent.rst)。明确原版已有双栈/组播能力、新增 MAC→VTEP 与 BUM 独立表、控制面同步和逐包路径，以及保留原生 `group`、当前 Agent 采用入口复制的边界。
 
-本次文档验证使用 Sphinx `-n -W --keep-going` 定向构建开发页、用户页和真实 LCP 页面，检查比较章节、处理流程和跨页锚点；不代表整套 VPP 手册或数据面代码重新编译、测试通过。
+此前架构对比文档使用 Sphinx `-n -W --keep-going` 定向构建开发页、用户页和真实 LCP 页面，检查比较章节、处理流程和跨页锚点；该次文档检查未重新编译数据面。后续 GitHub 分支构建与验收记录见下方，定向文档检查不等同整套 VPP 手册构建。
 
 本文记录本 fork 的当前实现、组件边界、构建方式和后续方向。代码位置与详细说明见 [适配开发文档](docs/developer/extras/sdn_agent.rst)、[使用指南](docs/usecases/sdn_agent.rst) 和 [Python 适配器说明](extras/sdn-agent/README.md)。配套 `sdn-agent` 仓库的 `docs/developer/vpp.rst` 包含完整节点表、操作与实验步骤。
 
@@ -14,7 +14,9 @@
 - **当前通信路径是 Go Agent → Python 适配进程 → VPP Binary API → VPP 核心及 C 插件。没有专门的 `sdn_agent_plugin.so` 直接连接 Agent。**
 - Python 是常驻控制进程，负责资源映射、事务配合和状态核对；逐包查表、封装、解封装、GSO 软件分段在 VPP 原生代码中执行。
 - FRR 通过 Linux 控制面对象感知接口、VRF、VNI、MAC/IP；Linux 镜像与 VPP 转发表由适配层协调。
-- 已验证基线为本地适配源码 VPP 26.06 / FRR 10.7.0；本地适配实现已提交为 `2814bd686`，完整远端源码镜像构建仍待验证。
+- 默认源码为 `nanfengnan1/vpp` 的 `sdn/v26.06` 与 `nanfengnan1/frr` 的 `frr-10.7.0`。2026-10-27 已完成 GitHub 源码镜像构建，VPP 实际提交 `194ee9f7db669e9776dd7e0fd9845ef2d9dd8031`，FRR 实际提交 `87fe21fda92ce9e2ba3eaf2b0a327bf71ee183ef`；两者来源元数据均 `dirty=false`。本 fork 的适配首次提交为 `2814bd686`。
+- GitHub 源码集成镜像 `alpine/sdn-agent:vpp-github-test` 已通过 IPv4/IPv6 underlay 四组软件实验：三 Leaf EVPN 各 23 个布尔检查（每 Leaf 两个 worker），双 Leaf IRB 各 29 个布尔检查；包含内层双栈、Type-2/3/5、隔离、回滚和撤销。验收使用镜像自带适配器，未挂载本地脚本。报告位于配套 Agent 的 `artifacts/vpp/github-sdn-v26.06-20261027-201038/`，本次未重复物理 VF 测试。
+- 本次同步后的 Agent 全部手册与 VPP 适配用户/开发/LCP 页定向严格构建通过，正式导航入口已核对。临时软件实验资源已清理，原运行容器未替换；无 Git 提交或推送。
 
 ## 2. 控制架构与通信边界
 
@@ -175,7 +177,7 @@ cp docker/vpp/startup.conf ~/sdn-vpp-node/startup.conf
 | 参数 | 作用 |
 |---|---|
 | `VPP_REPOSITORY` / `FRR_REPOSITORY` | 默认 `https://github.com/nanfengnan1/vpp.git` / `https://github.com/nanfengnan1/frr.git` |
-| `VPP_REF` | Git 模式必填，必须包含本 fork 适配代码的 tag、分支或 commit |
+| `VPP_REF` | Git 模式默认 `sdn/v26.06`；可指定包含本 fork 适配代码的 tag、分支或 commit |
 | `FRR_REF` | 默认 `frr-10.7.0`，支持 tag、分支或 commit |
 | `VPP_SOURCE` / `FRR_SOURCE` | 各自优先使用指定本地完整 clone，不自动 checkout；须含 `.git` 目录，暂不支持 linked worktree |
 | `BUILD_BASES` | 首次设为 `1`，先编译两种基础镜像再集成；`0` 复用匹配的基础镜像 |
@@ -233,10 +235,28 @@ python3 -m unittest discover -s extras/sdn-agent -p 'test_*.py'
 | 未实现 | 全量冷启动 Running 重放、在线切换数据面、EVPN 多归属与 HA |
 | 未实现 | Web/Controller 编辑或下发 `startup.conf`、启动配置热加载 |
 | 未实现 | 全事件驱动的 EVPN 状态同步；当前约每秒核对 |
-| 待验收 | 适配源码提交/推送后的 GitHub 完整镜像构建，以及新增版本组合 |
+| 待验收 | 移动分支的后续提交、新增 VPP/FRR/Alpine 版本组合及生产性能 |
 | 待验收 | 硬件 VXLAN TSO、RX LRO、RSS 多队列、外部物理布线、大规模收敛与生产吞吐 |
 | 讨论方向，未决定迁移 | 将 Python 的适配与状态同步移入 Go，使 Agent 直接调用 VPP Binary API；现有 C 数据面功能保留 |
 
 当前 TCP GSO 与校验和使用软件处理；IPv6 外层 UDP 校验和必须有效。保持 RX LRO 关闭，旧固定 src/dst 的 RX flow offload 规则不能用于多点接口。不要将网卡收发测试通过等同所有硬件隧道卸载已支持。
 
 文档更新时分别标注设计、实现和实际验收结果。物理设备绑定、部署、完整编译与代码发布是独立操作，文档修改不表示这些步骤已经执行。
+
+## 本地 MAC/IP 邻居保活插件
+
+新增 src/plugins/neighbor_keepalive：默认关闭的节点开关，主线程复用原生 ARP/ND
+学习结果，只跟踪显式授权 BVI/本地接入口上的动态邻居。按 BVI+AF+IP 隔离，
+发送单播 ARP/NS，收到有效学习才刷新状态；三次失败删除单个动态邻居，保留共用 MAC。
+不截获并丢弃应答，不通过发送通告或重发 Type-2 伪造存活。
+extras/sdn-agent/keepalive.py 管理策略与范围，irb.py 过滤失败项并撤销 Linux/FRR 镜像。
+API neighbor_keepalive_set/status/scope_add_del/scope_dump/dump；无异步订阅接口。
+MAC ageing 0 或 >=120 秒；默认 300 秒，按分钟量化预留余量，间隔约 108–120 秒。
+最大 4096 绑定，每秒 512 探测；失败项保留 300 秒，主机新学习后恢复。
+状态模型 version 3 兼容 version 1/2。运行状态不作为冷启动存活证据。
+
+IPv6 必须同时包含 ip6-nd / ip_neighbor_confirm_dp 的无 TLLA solicited NA 确认适配：只刷新已有动态且接口/IP/源 MAC 匹配的邻居。错误 MAC、非 solicited 和未知邻居不刷新。原生 show neighbor-keepalive 可诊断计时及计数。
+
+撤销本地 Linux 永久邻居时先发 NUD_FAILED 再删除，确保 FRR 撤销 Type-2；发布记录覆盖内核提前删除的情况，避让新 MAC/远端项。同步只在 bridge MAC 改变时设置，避免 Linux 反复清空邻居。
+
+2026-10-27 保活最终验收为软件端口实验：IPv4 VTEP + 2 workers + Controller/Web 34 项、IPv6 VTEP 32 项通过，包含无 TLLA NA、错误 MAC 拒绝、单 IP 撤销/恢复、关闭后的双栈转发。40 项 Python 适配测试通过。详细报告在 Agent artifacts/vpp/keepalive/validation.json；不扩大为物理 VF 或性能验收。

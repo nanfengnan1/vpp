@@ -11,6 +11,7 @@ import json
 import time
 
 from adapter import ALL, PREFIX, Engine, bd_id, plain, route_network, updated
+import keepalive
 
 SOURCE = PREFIX + "evpn"
 
@@ -135,6 +136,10 @@ class IRBEngine(Engine):
             self.api.call("delete_loopback", sw_if_index=index)
 
     def validate(self, op):
+        keepalive.validate(updated(self.model, op))
+        if op["code"] == "NEIGHBOR_KEEPALIVE":
+            self.api.call("neighbor_keepalive_status")
+            return
         code, action = op["code"], op["action"]
         deleting = action in ("DELETE", "UNBIND")
         if code == "TENANT":
@@ -342,8 +347,10 @@ class IRBEngine(Engine):
             if "mac" not in obj:
                 obj["mac"] = mac
                 self.save()
-            # Pin the Linux MAC so enslaving ports cannot silently change the RMAC.
-            self.run("ip", "link", "set", "dev", name, "address", mac)
+            # Restore drift without setting an unchanged MAC each cycle: Linux
+            # flushes permanent neighbors even for a same-address link update.
+            if links[name]["address"].lower() != mac.lower():
+                self.run("ip", "link", "set", "dev", name, "address", mac)
             index = bvis.get(name)
             if index is None:
                 existing = bridges[bd_id(name)].get("bvi_sw_if_index", ALL)
@@ -550,6 +557,7 @@ class IRBEngine(Engine):
                     )
 
     def sync_neighbors(self, bvis):
+        failed_bindings = keepalive.failed(self)
         kernel = json.loads(self.run("ip", "-j", "neigh", "show"))
         for row in kernel:
             if (
@@ -584,6 +592,8 @@ class IRBEngine(Engine):
                         continue
                     # Only advertise neighbors whose MAC was learned on a local access port.
                     mac = row["mac_address"]
+                    if (index, ip, mac) in failed_bindings:
+                        continue
                     if (name, mac) not in self.local or any(
                         r.get("dev") == name and r.get("dst") == ip and external(r)
                         for r in kernel
@@ -630,13 +640,33 @@ class IRBEngine(Engine):
                             },
                         )
         for (name, ip), mac in self.published_neighbors.items():
-            if (name, ip) not in published and any(
-                r.get("dev") == name
-                and r.get("dst") == ip
-                and r.get("lladdr") == mac
-                and not external(r)
-                for r in kernel
+            if (
+                name in bvis
+                and (name, ip) not in published
+                and not any(
+                    r.get("dev") == name
+                    and r.get("dst") == ip
+                    and (external(r) or r.get("lladdr") not in (None, mac))
+                    for r in kernel
+                )
             ):
+                # FRR treats RTM_DELNEIGH with NUD_PERMANENT as an RFC5549
+                # next-hop deletion and skips EVPN withdrawal. First publish
+                # an explicit reachability failure for this owned local IP,
+                # even if a prior link change already removed the kernel item.
+                # Never overwrite a new MAC or a remote winner for that IP.
+                self.run(
+                    "ip",
+                    "neigh",
+                    "replace",
+                    ip,
+                    "lladdr",
+                    mac,
+                    "dev",
+                    name,
+                    "nud",
+                    "failed",
+                )
                 self.run("ip", "neigh", "del", ip, "dev", name)
         self.published_neighbors = published
         # Native BD ARP/ND termination is fed only by FRR-selected remote bindings.
@@ -792,6 +822,7 @@ class IRBEngine(Engine):
         self.release_mirrors()
         super().reconcile()
         bvis = self.ensure_bvis()
+        keepalive.reconcile(self, bvis)
         self.isolate_mirrors()
         self.sync_neighbors(bvis)
         self.sync_routes(bvis)
@@ -827,6 +858,8 @@ class IRBEngine(Engine):
         self.last_success = time.time()
 
     def verify(self, op):
+        if op["code"] == "NEIGHBOR_KEEPALIVE":
+            return keepalive.verify(self)
         code = op["code"]
         if updated(self.model, op) != self.model:
             raise RuntimeError("VPP desired state does not contain operation")
@@ -913,6 +946,12 @@ class IRBEngine(Engine):
         return {"verified": True}
 
     def rollback_expectation(self, op):
+        if op["code"] == "NEIGHBOR_KEEPALIVE":
+            return {
+                "code": op["code"],
+                "action": "SET",
+                "neighborKeepalive": {"enabled": keepalive.enabled(self.model)},
+            }
         if op["code"] == "STATIC_ROUTE" and op["route"].get("table", 0) not in (0, 254):
             obj = op["route"]
             family = "-6" if route_network(obj).version == 6 else "-4"
@@ -942,6 +981,8 @@ class IRBEngine(Engine):
         return super().rollback_expectation(op)
 
     def query(self, q):
+        if q.get("kind") == "NEIGHBOR_KEEPALIVE_STATUS":
+            return keepalive.query(self, q)
         kind = q.get("kind")
         interfaces, _, tunnels, pairs = self.api.snapshot()
         bvis = self.bvis(interfaces)

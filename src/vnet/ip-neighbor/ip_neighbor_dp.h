@@ -15,5 +15,6 @@
  */
 
 extern void ip_neighbor_learn_dp (const ip_neighbor_learn_t * l);
+extern void ip_neighbor_confirm_dp (const ip_neighbor_learn_t *l);
 
 #endif /* __INCLUDE_IP_NEIGHBOR_H__ */

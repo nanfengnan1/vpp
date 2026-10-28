@@ -61,6 +61,7 @@ def empty():
             "bindings",
             "l3vnis",
             "addresses",
+            "neighborKeepalive",
         )
     }
 
@@ -108,6 +109,11 @@ def updated(model, op):
     """Materialize only managed L2 configuration, not learned remote state."""
     result = normalized(model)
     code, action = op["code"], op["action"]
+    if code == "NEIGHBOR_KEEPALIVE":
+        obj = op.get("neighborKeepalive", {})
+        if action != "SET" or type(obj.get("enabled")) is not bool:
+            raise ValueError("neighbor keepalive requires SET with explicit enabled")
+        result["neighborKeepalive"] = {"enabled": obj["enabled"]}
     if code in (
         "BD",
         "VXLAN",
@@ -201,7 +207,7 @@ class Engine:
         saved = (
             json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
         )
-        if saved and saved.get("version") not in (1, 2):
+        if saved and saved.get("version") not in (1, 2, 3):
             raise RuntimeError("unsupported VPP adapter state version")
         self.model = normalized(saved.get("desired", empty()))
         self.previous = saved.get("previous")
@@ -218,7 +224,7 @@ class Engine:
     def save(self):
         atomic_json(
             self.state_file,
-            {"version": 2, "desired": self.model, "previous": self.previous},
+            {"version": 3, "desired": self.model, "previous": self.previous},
         )
 
     def restore_mirrors(self):
