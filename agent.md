@@ -1,5 +1,12 @@
 # VPP 与 SDN Agent 适配架构
 
+## 2026-10-29：Snort IP 元数据修复
+
+普通 IP feature arcs 的 DAQ 元数据改存描述符，保留 buffer 中的邻接、FIB 和 rewrite。
+修复租户 BVI 输入检查破坏 IPv6 ND 的问题；SFDP 自定义 continuation 保留 opaque 交换。
+补充非默认租户 BVI 的冷邻居学习与双向检查回归；实际验收结果见配套 Agent 部署记录。
+主动响应注入与性能不在本次验证范围。
+
 
 ## 2026-10-28：Snort3 / SDN IPS 接入
 

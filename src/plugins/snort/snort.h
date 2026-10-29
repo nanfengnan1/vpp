@@ -351,6 +351,15 @@ snort_get_instance_by_index (u32 instance_index)
   return pool_elt_at_index (sm->instances, instance_index);
 }
 
+/* SFDP consumers use a private continuation and exchange opaque metadata.
+ * IP feature arcs must retain their adjacencies, FIB and rewrite length. */
+static_always_inline int
+snort_next_is_ip_arc (u16 next_index)
+{
+  return next_index >= SNORT_ENQ_NEXT_IP4_INPUT &&
+         next_index <= SNORT_ENQ_NEXT_IP6_OUTPUT;
+}
+
 static_always_inline daq_vpp_pkt_metadata_t *
 snort_get_buffer_metadata (vlib_buffer_t *b)
 {

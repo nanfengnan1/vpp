@@ -116,9 +116,23 @@ snort_enq_qpair (vlib_main_t *vm, vlib_node_runtime_t *node,
   return old_n_free_descs - n_free_descs;
 }
 
+/* DAQ metadata belongs in the descriptor. vnet_buffer()->unused aliases
+ * ip.adj_index / fib_index and is not scratch space on IP feature arcs. */
+static_always_inline daq_vpp_pkt_metadata_t
+snort_packet_metadata (vlib_buffer_t *b, int is_output, int ip_arc)
+{
+  if (!ip_arc)
+    return *snort_get_buffer_metadata (b);
+
+  return (daq_vpp_pkt_metadata_t){
+    .flags = is_output ? 0 : DAQ_VPP_PKT_FLAG_PRE_ROUTING,
+    .ingress_index = vnet_buffer (b)->sw_if_index[VLIB_RX],
+  };
+}
+
 static_always_inline void
 snort_enq_prepare_descs (vlib_main_t *vm, vlib_buffer_t **b, daq_vpp_desc_t *d, void **iph,
-			 u32 n_left, int use_rewrite_length_offset, int with_hash)
+			 u32 n_left, int use_rewrite_length_offset, int with_hash, int ip_arc)
 {
   snort_main_t *sm = &snort_main;
   u8 bpi[4];
@@ -172,10 +186,10 @@ snort_enq_prepare_descs (vlib_main_t *vm, vlib_buffer_t **b, daq_vpp_desc_t *d, 
 	  iph[3] = p[3];
 	}
 
-      d[0].metadata = *snort_get_buffer_metadata (b[0]);
-      d[1].metadata = *snort_get_buffer_metadata (b[1]);
-      d[2].metadata = *snort_get_buffer_metadata (b[2]);
-      d[3].metadata = *snort_get_buffer_metadata (b[3]);
+      d[0].metadata = snort_packet_metadata (b[0], use_rewrite_length_offset, ip_arc);
+      d[1].metadata = snort_packet_metadata (b[1], use_rewrite_length_offset, ip_arc);
+      d[2].metadata = snort_packet_metadata (b[2], use_rewrite_length_offset, ip_arc);
+      d[3].metadata = snort_packet_metadata (b[3], use_rewrite_length_offset, ip_arc);
     }
 
   for (; n_left; b++, d++, iph++, n_left--)
@@ -193,7 +207,7 @@ snort_enq_prepare_descs (vlib_main_t *vm, vlib_buffer_t **b, daq_vpp_desc_t *d, 
       if (with_hash)
 	iph[0] = p[0];
 
-      d[0].metadata = *snort_get_buffer_metadata (b[0]);
+      d[0].metadata = snort_packet_metadata (b[0], use_rewrite_length_offset, ip_arc);
     }
 }
 
@@ -239,6 +253,7 @@ VLIB_NODE_FN (snort_enq_node)
   u16 with_hash = (qpairs_per_thread > 1 && use_flow_id_hash == 0) ? 1 : 0;
   snort_qpair_t **qp;
   u16 next_index = sa->dequeue_node_next_index;
+  int ip_arc = snort_next_is_ip_arc (next_index);
   daq_vpp_desc_t descs[VLIB_FRAME_SIZE];
   void *ip_hdrs[VLIB_FRAME_SIZE];
   u32 hashes[VLIB_FRAME_SIZE];
@@ -258,16 +273,16 @@ VLIB_NODE_FN (snort_enq_node)
   if (sa->use_rewrite_length_offset)
     {
       if (with_hash)
-	snort_enq_prepare_descs (vm, bufs, descs, ip_hdrs, n_from, 1, 1);
+	snort_enq_prepare_descs (vm, bufs, descs, ip_hdrs, n_from, 1, 1, ip_arc);
       else
-	snort_enq_prepare_descs (vm, bufs, descs, 0, n_from, 1, 0);
+	snort_enq_prepare_descs (vm, bufs, descs, 0, n_from, 1, 0, ip_arc);
     }
   else
     {
       if (with_hash)
-	snort_enq_prepare_descs (vm, bufs, descs, ip_hdrs, n_from, 0, 1);
+	snort_enq_prepare_descs (vm, bufs, descs, ip_hdrs, n_from, 0, 1, ip_arc);
       else
-	snort_enq_prepare_descs (vm, bufs, descs, 0, n_from, 0, 0);
+	snort_enq_prepare_descs (vm, bufs, descs, 0, n_from, 0, 0, ip_arc);
     }
 
   if (qpairs_per_thread > 1)
@@ -340,9 +355,6 @@ snort_arc_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
   u32 *buffer_indices = vlib_frame_vector_args (frame), *bi = buffer_indices;
   u32 n_pkts = frame->n_vectors, n_left = n_pkts, n_total_left = n_pkts;
   u16 instance_indices[VLIB_FRAME_SIZE], *ii = instance_indices;
-  daq_vpp_pkt_metadata_t metadata = {
-    .flags = is_output ? 0 : DAQ_VPP_PKT_FLAG_PRE_ROUTING,
-  };
   u8 dir = is_output ? VLIB_TX : VLIB_RX;
 
   for (; n_left >= 8; n_left -= 4, bi += 4, ii += 4)
@@ -359,13 +371,9 @@ snort_arc_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
       b3 = vlib_get_buffer (vm, bi[3]);
 
       ii[0] = instance_by_interface[vnet_buffer (b0)->sw_if_index[dir]];
-      *snort_get_buffer_metadata (b0) = metadata;
       ii[1] = instance_by_interface[vnet_buffer (b1)->sw_if_index[dir]];
-      *snort_get_buffer_metadata (b1) = metadata;
       ii[2] = instance_by_interface[vnet_buffer (b2)->sw_if_index[dir]];
-      *snort_get_buffer_metadata (b2) = metadata;
       ii[3] = instance_by_interface[vnet_buffer (b3)->sw_if_index[dir]];
-      *snort_get_buffer_metadata (b3) = metadata;
     }
 
   for (; n_left; n_left -= 1, bi += 1, ii += 1)
@@ -374,7 +382,6 @@ snort_arc_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
 
       b0 = vlib_get_buffer (vm, bi[0]);
       ii[0] = instance_by_interface[vnet_buffer (b0)->sw_if_index[dir]];
-      *snort_get_buffer_metadata (b0) = metadata;
     }
 
   if (PREDICT_FALSE (node->flags & VLIB_NODE_FLAG_TRACE))

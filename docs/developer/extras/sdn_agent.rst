@@ -535,3 +535,13 @@ Agent 通过 Snort Binary API 管理实例、接口方向并回读连接状态�
 避免与未分配队列的哨兵值冲突；未绑定接口的 v2 查询增加向量边界检查；
 v2 client dump 使用对应的 v2 回复消息。
 完整协议、部署和验收见配套 sdn-agent 的开发文档 ips.rst。
+
+Snort IP feature arc 元数据
+-------------------------
+
+IP feature arc 的 DAQ 元数据直接放在共享内存描述符中。VPP buffer 的
+``unused`` 与 IP adjacency、FIB、rewrite 信息是 union 别名，不能用作
+Snort 临时空间；放行或阻断判定也不能覆盖这些字段。否则输入检查会破坏
+IPv6 单播 ND 的源邻接检查，输出检查会破坏已选定的邻接和二层 rewrite。
+SFDP 的自定义 continuation 仍保留原来的 opaque 元数据交换方式。
+本修复范围是普通报文检查和判定；主动响应报文注入另需验证。

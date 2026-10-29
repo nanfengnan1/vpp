@@ -162,7 +162,10 @@ more:
       n_verdicsts[verdict]++;
       qpe->buffer_index = ~0;
       b = vlib_get_buffer (vm, bi);
-      *snort_get_buffer_metadata (b) = d->metadata;
+      /* A verdict must not overwrite the IP forwarding context. Custom
+       * consumers (SFDP) still receive their opaque metadata as before. */
+      if (!snort_next_is_ip_arc (qpe->next_index))
+        *snort_get_buffer_metadata (b) = d->metadata;
 
       /* put descriptor back to freelist */
       qpe->freelist_next = next_free;
