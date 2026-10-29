@@ -301,7 +301,7 @@ VXLAN SET 不自动配置它们。当前 Agent 的 STATIC_ROUTE 资源没有 nex
 可在部署时的 FRR 配置文件中维护此项。
 
 Snort IPS 配套使用
------------------
+------------------------------------------------
 
 SDN Agent 的 VPP 集成镜像可同时运行 FRR、Snort3 和 confd。
 规则经 Agent Redis / confd 校验热重载，VPP 通过共享内存 DAQ 传递报文与判定。

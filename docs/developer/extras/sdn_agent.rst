@@ -524,7 +524,7 @@ artifacts/vpp/encap-vrf-20261028-143107/verification.json。
 
 
 Snort IPS 接入
--------------
+------------------------------------------------
 
 配套 Agent 的可选 IPS 后端复用节点 Redis，通过 confd 生成配置并确认
 Snort 热重载；规则不通过 VPP CLI 下发。VPP 与 Snort3 使用共享内存 DAQ，
@@ -537,7 +537,7 @@ v2 client dump 使用对应的 v2 回复消息。
 完整协议、部署和验收见配套 sdn-agent 的开发文档 ips.rst。
 
 Snort IP feature arc 元数据
--------------------------
+------------------------------------------------
 
 IP feature arc 的 DAQ 元数据直接放在共享内存描述符中。VPP buffer 的
 ``unused`` 与 IP adjacency、FIB、rewrite 信息是 union 别名，不能用作
