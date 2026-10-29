@@ -218,6 +218,13 @@ daq_vpp_instantiate (DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstance_h modinst,
 
   n_instances = vdm->daq_base_api.config_get_total_instances (modcfg);
   instance_id = vdm->daq_base_api.config_get_instance_id (modcfg);
+  /* libdaq uses zero for an ordinary single-instance configuration. The VPP
+   * queue ownership field reserves zero for unassigned queues. */
+  if (n_instances == 0)
+    {
+      n_instances = 1;
+      instance_id = 1;
+    }
   input_name = vdm->daq_base_api.config_get_input (modcfg);
 
   vdm->n_instances++;

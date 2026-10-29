@@ -1,5 +1,18 @@
 # VPP 与 SDN Agent 适配架构
 
+
+## 2026-10-28：Snort3 / SDN IPS 接入
+
+SDN Agent 通过 Redis + confd 管理 Snort3 Lua/规则热重载，不增加节点 etcd。
+VPP 插件负责 IP feature arcs 与共享内存 DAQ；纯二层转发不在检查范围。
+修复单实例 DAQ 编号 0、未绑定接口 v2 查询越界、client v2 dump 回复编号。
+配套镜像安装 Snort 3.12.2.0 / libdaq 3.0.27；规则 CRUD 与查询由 SDN 事务负责。
+已构建并通过 IPv4/IPv6 IPS 阻断、热重载、错误规则回滚、重启恢复、真实浏览器操作和 EVPN 回归。
+原生测试覆盖未绑定接口与无效索引查询、client v2 状态、单实例 inline DAQ。
+报告：配套 Agent 仓库 artifacts/ips/redis-20261028-164849/verification.json。
+本次仅软件 TAP 路径，未测试物理 NIC 或性能；尚未提交或推送。
+
+
 ## 2026-10-28：VXLAN 外层 VRF 创建与修改
 
 已实现配置字段 encapVrfId / protobuf encap_vrf_id，默认 0，与 BD/BVI 的内层租户 VRF 独立。

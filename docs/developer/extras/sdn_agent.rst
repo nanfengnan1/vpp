@@ -521,3 +521,17 @@ Agent / Controller / Gateway 全部 Go 测试、45 项 Python 适配器测试、
 汇总报告：配套 Agent 仓库
 artifacts/vpp/encap-vrf-20261028-143107/verification.json。
 未替换运行环境或覆盖 v1.0；此次为软件路径验收，不代表物理网卡或性能验收。
+
+
+Snort IPS 接入
+-------------
+
+配套 Agent 的可选 IPS 后端复用节点 Redis，通过 confd 生成配置并确认
+Snort 热重载；规则不通过 VPP CLI 下发。VPP 与 Snort3 使用共享内存 DAQ，
+Agent 通过 Snort Binary API 管理实例、接口方向并回读连接状态。
+目前只覆盖 IPv4/IPv6 的输入/输出 feature arcs，不覆盖纯 BD 二层交换。
+
+兼容修复：libdaq 单实例配置使用 0，VPP DAQ 将其规范为一个实例、编号 1，
+避免与未分配队列的哨兵值冲突；未绑定接口的 v2 查询增加向量边界检查；
+v2 client dump 使用对应的 v2 回复消息。
+完整协议、部署和验收见配套 sdn-agent 的开发文档 ips.rst。

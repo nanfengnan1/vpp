@@ -299,3 +299,15 @@ EVPN 强行选路。使用其他 IGP/BGP 泄漏方案时同样验证 show ip nht
 接口移动、该路由泄漏及其启动恢复由承载网络配置负责，
 VXLAN SET 不自动配置它们。当前 Agent 的 STATIC_ROUTE 资源没有 nexthop-vrf 字段；
 可在部署时的 FRR 配置文件中维护此项。
+
+Snort IPS 配套使用
+-----------------
+
+SDN Agent 的 VPP 集成镜像可同时运行 FRR、Snort3 和 confd。
+规则经 Agent Redis / confd 校验热重载，VPP 通过共享内存 DAQ 传递报文与判定。
+仅 IP feature 路径适用；普通 BD 二层交换不会被此绑定检查。
+启动文件需启用 snort_plugin.so，接口绑定用 VPP 原生三层/BVI 名称。
+
+基础 Lua 可只读挂载给 Agent，通过 ips.configFile 指定，手动命令为
+sdn-snort-reload；Web 托管规则独立保存。详细启动、目录挂载和故障恢复见
+配套 sdn-agent 的 docs/user/ips.rst，内部协议见 docs/developer/ips.rst。
